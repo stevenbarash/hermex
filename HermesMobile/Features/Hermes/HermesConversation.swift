@@ -63,6 +63,8 @@ enum ConversationTarget: Hashable, Sendable {
     /// Before connecting: restore local state, such as the draft. `attempt` is the attach's generation.
     func conversationWillAttach(_ attempt: Int) async throws
     /// The attach found the session's root: the Bot Chat's canonical root, or the session's key.
+    /// After `session.create`, `target` is already `.session`: move anything saved under the
+    /// `.new` target's keys, such as the draft and its attachments, to the session's keys here.
     func conversationDidIdentify(root: String)
     /// The identity resume reached `runtime`; the replay is next. `newRuntime` when it is
     /// not the runtime the last attach reached, so no turn carried over.

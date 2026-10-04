@@ -277,7 +277,8 @@ own guard against a newer request on screen (see the blocking requests below). T
   in the reduced reply of a session that has not started).
 - `.new(profile)`: `session.create` with only `profile` (no Bot Chat title, not
   hidden), once; it then becomes `.session` on the `stored_session_id`, so a
-  reattach resumes it. Bot Chats are still created only by `BotCreator.ensureChat`.
+  reattach resumes it, and the owner moves the `.new` draft to the session's key in
+  `conversationDidIdentify`. Bot Chats are still created only by `BotCreator.ensureChat`.
 
 Each target has its own draft key (`ChatDraftKey.hermesSession` for sessions, which
 `discardBotDrafts` removes with its connection) and recent-transcript key; a Bot
