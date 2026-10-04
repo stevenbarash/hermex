@@ -152,7 +152,7 @@ connection's sockets `s0`, `s1`, …, never the server: interpolate only numbers
 case and method names, the release `/api/status` reports (upstream's package version) and
 `HermesConnectionLog.reason(_:)`, each `.public`, and never a host, address, URL,
 session or runtime id, Profile name, title, message text, ticket, replay epoch or
-install id. Events, deltas and keepalive pongs are never logged. `BotConversation` logs
+install id. Events, deltas and keepalive pongs are never logged. `HermesConversation` logs
 through the same logger, counts and codes only: each reattach (automatic retries before
 it, and frames held, applied and dropped) and each `session.resume` refusal it retries.
 
@@ -259,11 +259,35 @@ the rejected record. The app never resends that password on its own; foregroundi
 pull to refresh and closing the form unsaved send nothing until the saved record
 changes or the form saves a sign-in.
 
-`BotConversation` owns one server/connection/Profile view lifetime. It resolves
-exact-title Bot Chat, keeps canonical root, compression tip and runtime IDs
-separate, and rejects a changed root before resume. Lookup can recover archived
-history; resume can auto-continue unfinished backend work. Neither is guaranteed
-to be read-only.
+`HermesConversation` (`Features/Hermes/`) is the conversation engine (#903): it
+attaches one screen to one Hermes session for a `ConversationTarget`, replays what
+was missed, holds frames while attaching, reconnects, and hands its owner the
+session's frames in `seq` order, with a rebuild signal when some were lost
+(`HermesConversationOwner`). It keeps the stored key, which names a session and keys
+drafts and caches, apart from the runtime id, which keys session-scoped calls and
+`seq`, changes after a reap, and is never kept. The Profile goes on every call.
+Recovery only reads; deliberate writes go through its `write`, which revalidates the
+attach and runtime at the socket write, and nothing is resent. Targets:
+- `.canonicalChat(profile)`: the Bot Chat, found by exact title on every attach. Only
+  this target runs the title lookup and rejects a changed root before resume.
+- `.session(profile, key)`: a stored session. It resumes its key with no lookup and
+  takes the stored key the host resolved (a compression tip, or `stored_session_id`
+  in the reduced reply of a session that has not started).
+- `.new(profile)`: `session.create` with only `profile` (no Bot Chat title, not
+  hidden), once; it then becomes `.session` on the `stored_session_id`, so a
+  reattach resumes it. Bot Chats are still created only by `BotCreator.ensureChat`.
+
+Each target has its own draft key (`ChatDraftKey.hermesSession` for sessions, which
+`discardBotDrafts` removes with its connection) and recent-transcript key; a Bot
+Chat keeps the keys it always had. Only a Bot Chat writes the search index. `.session`
+and `.new` get their first production caller in #701 slice 1.1 (#1010), which reduces
+deltas where Bot Chat rebuilds its text from snapshots.
+
+`BotConversation` owns one server/connection/Profile view lifetime and is the engine's
+Bot Chat owner: it keeps the snapshot-driven transcript and the Bot features (mentions,
+reactions, slash commands, file search, delegated work, chat controls). Lookup can
+recover archived history; resume can auto-continue unfinished backend work. Neither
+is guaranteed to be read-only.
 
 Live history is rebuilt from a full resume snapshot on open/recovery. A separate
 read-only local cache supports message search; see Local search below.

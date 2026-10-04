@@ -99,3 +99,7 @@ _Avoid_: Multi-select, bulk mode
 **Fork**:
 A chat created from another chat's history by Fork From Here or `/branch` (`/api/session/branch`). The server marks it `session_source: fork` with a `parent_session_id`, and Hermex shows a "Forked from" row that opens the parent. Agent child sessions (subagents, cron, CLI `/new`) also carry a parent but are not Forks.
 _Avoid_: Branch (for the chat), child session
+
+**Conversation target**:
+Which Hermes session a conversation attaches to: a bot's canonical Bot Chat, found by its title; a stored session, by its stored key; or a new session, created on first attach. Each target has its own draft and recent transcript (`ConversationTarget`).
+_Avoid_: chat target, session kind

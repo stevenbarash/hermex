@@ -38,6 +38,11 @@ enum HermesCall: Equatable, Sendable {
     /// focused row, which Hermex never has.
     case sessionActiveList
 
+    // Sessions
+    /// Mints a plain session under the Profile: no title, not hidden. The host writes no
+    /// row until its first prompt (`ConversationTarget.new`).
+    case sessionNew(profile: String)
+
     // Turns
     /// Always `queued`: even an idle Send can race Desktop, so a fresh send never
     /// inherits a host setting that converts it into a redirect or steer.
@@ -185,7 +190,7 @@ enum HermesCall: Equatable, Sendable {
         case .profilesConfigure: return "profiles.configure"
         case .profilesCreate: return "profiles.create"
         case .sessionList: return "session.list"
-        case .sessionCreate: return "session.create"
+        case .sessionCreate, .sessionNew: return "session.create"
         case .sessionTitle: return "session.title"
         case .sessionResume: return "session.resume"
         case .sessionEventsSince: return "session.events.since"
@@ -246,6 +251,7 @@ enum HermesCall: Equatable, Sendable {
         case .sessionCreate(let profile):
             return ["profile": .string(profile), "title": .string(Self.botChatTitle),
                     "hidden": .bool(true), "follow_profile_config": .bool(true)]
+        case .sessionNew(let profile): return ["profile": .string(profile)]
         case .sessionTitle(let sessionID): return ["session_id": .string(sessionID), "title": .string(Self.botChatTitle)]
         case .sessionResume(let profile, let sessionID, let omitMessages):
             var params: [String: BotJSON] = ["profile": .string(profile), "session_id": .string(sessionID),
@@ -350,7 +356,7 @@ enum HermesCall: Equatable, Sendable {
             else { valid = !name.isEmpty }
         case .profilesConfigure(let changes): valid = changes.isAdmissible
         case .profilesCreate(let profile): valid = profile.isAdmissible
-        case .sessionCreate(let profile): valid = !profile.isEmpty
+        case .sessionCreate(let profile), .sessionNew(let profile): valid = !profile.isEmpty
         case .sessionTitle(let sessionID), .commandsCatalog(let sessionID), .subagentList(let sessionID):
             valid = !sessionID.isEmpty
         case .configSet(let sessionID, _, let setting):

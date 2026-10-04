@@ -163,6 +163,9 @@ struct ChatDraftKey: Hashable, Sendable {
     enum Context: Hashable, Sendable {
         case session(String)
         case bot(connectionID: UUID, profile: String)
+        /// A Hermes session on a Hermes connection, by its stored key; nil for a new
+        /// session not created yet (`ConversationTarget`).
+        case hermesSession(connectionID: UUID, profile: String, key: String?)
         case newChat
     }
 
@@ -175,6 +178,10 @@ struct ChatDraftKey: Hashable, Sendable {
 
     static func bot(server: URL, connectionID: UUID, profile: String) -> Self {
         Self(serverID: server.absoluteString, context: .bot(connectionID: connectionID, profile: profile))
+    }
+
+    static func hermesSession(server: URL, connectionID: UUID, profile: String, key: String?) -> Self {
+        Self(serverID: server.absoluteString, context: .hermesSession(connectionID: connectionID, profile: profile, key: key))
     }
 
     static func newChat(server: URL) -> Self {
@@ -413,6 +420,11 @@ actor ChatDraftFilePersistence: ChatDraftPersisting {
                 sessionID = nil
                 self.connectionID = connectionID
                 self.profile = profile
+            case .hermesSession(let connectionID, let profile, let key):
+                context = "hermesSession"
+                sessionID = key
+                self.connectionID = connectionID
+                self.profile = profile
             case .newChat:
                 context = "newChat"
                 sessionID = nil
@@ -465,6 +477,11 @@ actor ChatDraftFilePersistence: ChatDraftPersisting {
             case "bot":
                 guard let connectionID, let profile, !profile.isEmpty else { return nil }
                 key = ChatDraftKey(serverID: serverID, context: .bot(connectionID: connectionID, profile: profile))
+            case "hermesSession":
+                guard let connectionID, let profile, !profile.isEmpty else { return nil }
+                let session = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                key = ChatDraftKey(serverID: serverID, context: .hermesSession(
+                    connectionID: connectionID, profile: profile, key: session?.isEmpty == false ? session : nil))
             case "newChat":
                 key = ChatDraftKey(serverID: serverID, context: .newChat)
             default:
@@ -624,12 +641,18 @@ final class ChatDraftStore {
         updateDraft(for: key) { $0.botSubmissionUncertain = uncertain }
     }
 
-    /// Drops Bot drafts for a server, one connection, or one deleted bot on it.
+    /// Drops Bot Chat and Hermes session drafts for a server, one connection, or one
+    /// deleted bot on it.
     func discardBotDrafts(server: URL, connectionID: UUID? = nil, profile: String? = nil) async {
         await loadIfNeeded()
         await discardDrafts { key in
-            guard key.serverID == server.absoluteString,
-                  case .bot(let id, let name) = key.context else { return false }
+            guard key.serverID == server.absoluteString else { return false }
+            let id: UUID, name: String
+            switch key.context {
+            case .bot(let keyConnection, let keyProfile), .hermesSession(let keyConnection, let keyProfile, _):
+                (id, name) = (keyConnection, keyProfile)
+            case .session, .newChat: return false
+            }
             return (connectionID == nil || id == connectionID) && (profile == nil || name == profile)
         }
     }
