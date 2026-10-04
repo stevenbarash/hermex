@@ -267,7 +267,9 @@ session's frames in `seq` order, with a rebuild signal when some were lost
 drafts and caches, apart from the runtime id, which keys session-scoped calls and
 `seq`, changes after a reap, and is never kept. The Profile goes on every call.
 Recovery only reads; deliberate writes go through its `write`, which revalidates the
-attach and runtime at the socket write, and nothing is resent. Targets:
+attach and runtime at the socket write, and nothing is resent. The owner gets the
+replay reply and the snapshot whole and restores open requests from them, with its
+own guard against a newer request on screen (see the blocking requests below). Targets:
 - `.canonicalChat(profile)`: the Bot Chat, found by exact title on every attach. Only
   this target runs the title lookup and rejects a changed root before resume.
 - `.session(profile, key)`: a stored session. It resumes its key with no lookup and

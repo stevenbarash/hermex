@@ -54,7 +54,9 @@ enum ConversationTarget: Hashable, Sendable {
 /// What a `HermesConversation` asks of the screen model that owns it. The engine calls
 /// these in order on the main actor; an async one that throws ends the attach as a failure.
 /// The owner renders: Bot Chat rebuilds its text from snapshots, a Hermes session reduces
-/// the frames' deltas.
+/// the frames' deltas. The owner also restores open requests (`open_requests`) from the
+/// replay reply and the snapshot, since which cards are on screen, and whether a newer
+/// request or answer arrived while a read was in flight, is screen state.
 @MainActor protocol HermesConversationOwner: AnyObject {
     /// A new attach or `suspend()` cleared the connection. Drop what belonged to it.
     func conversationDidReset()
