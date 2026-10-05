@@ -40,7 +40,7 @@ Hermex is a native SwiftUI iPhone app for driving a self-hosted [hermes-webui](h
 - **Tasks** — view and edit your agent's scheduled cron jobs from your phone.
 - **Skills** — browse and search the agent's installed skills.
 - **Workspace browser** — explore your server's file system from the app.
-- **File previews** — open PDFs and supported documents in-app with native Quick Look from the workspace, attachments, and chat file cards. Export remains available; document previews are limited to 25 MB.
+- **File previews** — open PDFs and supported documents in-app with native Quick Look from the workspace, attachments, and chat file cards. Export remains available directly from chat file cards without opening a preview; document previews are limited to 25 MB.
 - **Memory & Insights** — read-only panels for agent memory and usage analytics.
 
 <div align="center">
