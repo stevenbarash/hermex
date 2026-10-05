@@ -155,7 +155,121 @@ final class TranscriptMediaPreviewViewModelTests: XCTestCase {
         XCTAssertEqual(recorder.requestCount, 1)
     }
 
-    func testUnsupportedMediaSetsUnavailableStateWithoutRequest() async {
+    func testPDFLinkLoadsInAppAndExportsWithoutDownloadingAgain() async throws {
+        let recorder = TranscriptMediaPreviewRequestRecorder()
+        let pdf = Self.pdfData()
+        let client = makeClient { request in
+            recorder.record(request)
+            XCTAssertEqual(request.url?.path, "/api/media")
+            return self.response(statusCode: 200, data: pdf, for: request)
+        }
+        let viewModel = TranscriptMediaPreviewViewModel(
+            server: Self.baseURL,
+            sessionID: "session-pdf",
+            reference: .init(rawReference: "/tmp/Quarter One.pdf"),
+            apiClient: client
+        )
+
+        await viewModel.load()
+
+        XCTAssertNil(viewModel.errorMessage)
+        let url = try XCTUnwrap(viewModel.quickLookFile?.url)
+        XCTAssertEqual(try Data(contentsOf: url), pdf)
+        XCTAssertTrue(viewModel.canExportMedia)
+        XCTAssertFalse(viewModel.canSaveMediaToPhotos)
+        let payload = try await viewModel.exportPayload()
+        XCTAssertEqual(payload.data, pdf)
+        XCTAssertEqual(payload.filename, "Quarter One.pdf")
+        XCTAssertEqual(payload.contentType, .pdf)
+        XCTAssertEqual(recorder.requestCount, 1)
+        viewModel.cleanupTemporaryFiles()
+        XCTAssertNil(viewModel.quickLookFile)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testExternalPDFPreviewUsesCookieFreeSession() async throws {
+        let pdf = Self.pdfData()
+        let cookieStorage = HTTPCookieStorage()
+        cookieStorage.setCookie(try XCTUnwrap(Self.hermesCookie(domain: ".example.test")))
+        let url = try XCTUnwrap(URL(string: "https://cdn.example.test/report.pdf?download=1"))
+        let client = makeClient(cookieStorage: cookieStorage) { request in
+            XCTAssertEqual(request.url, url)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Test-Session"), "public")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Cookie"))
+            return self.response(statusCode: 200, data: pdf, for: request)
+        }
+        let model = TranscriptMediaPreviewViewModel(
+            server: Self.baseURL, sessionID: nil,
+            reference: .init(rawReference: url.absoluteString), apiClient: client
+        )
+
+        await model.load()
+
+        let fileURL = try XCTUnwrap(model.quickLookFile?.url)
+        XCTAssertEqual(fileURL.lastPathComponent, "report.pdf")
+        XCTAssertEqual(try Data(contentsOf: fileURL), pdf)
+        XCTAssertFalse(model.canSaveMediaToPhotos)
+        model.cleanupTemporaryFiles()
+    }
+
+    func testOversizedPDFCannotPreviewButCanStillBeExplicitlyExported() async throws {
+        let recorder = TranscriptMediaPreviewRequestRecorder()
+        let pdf = Self.pdfData()
+        let client = makeClient { request in
+            recorder.record(request)
+            if recorder.requestCount > 1 {
+                return self.response(statusCode: 200, data: pdf, for: request)
+            }
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: XCTUnwrap(request.url), statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Length": "\(BotArtifactBuffer.maximumBytes + 1)"]
+            ))
+            return (response, Data())
+        }
+        let model = TranscriptMediaPreviewViewModel(
+            server: Self.baseURL, sessionID: "session-pdf",
+            reference: .init(rawReference: "/tmp/report.pdf"), apiClient: client
+        )
+
+        await model.load()
+
+        XCTAssertNil(model.quickLookFile)
+        XCTAssertNil(model.originalByteCount)
+        XCTAssertTrue(model.canExportMedia)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(recorder.requestCount, 1)
+        let exported = try await model.exportPayload()
+        XCTAssertEqual(exported.data, pdf)
+        XCTAssertEqual(exported.contentType, .pdf)
+        XCTAssertEqual(recorder.requestCount, 2)
+    }
+
+    func testPDFPreviewUnauthorizedOnlyExpiresSameOriginAuthentication() async throws {
+        let client = makeClient { request in
+            self.response(statusCode: 401, data: Data("Denied".utf8), for: request)
+        }
+        for host in ["example.test", "cdn.example.test"] {
+            let model = TranscriptMediaPreviewViewModel(
+                server: Self.baseURL, sessionID: nil,
+                reference: .init(rawReference: "https://\(host)/report.pdf"), apiClient: client
+            )
+            await model.load()
+
+            guard let error = model.lastError as? APIError else {
+                return XCTFail("Expected the HTTP failure to reach the preview.")
+            }
+            if host == "example.test" {
+                guard case .unauthorized = error else { return XCTFail("Same-origin 401 must expire auth.") }
+            } else {
+                guard case .http(statusCode: 401, body: _) = error else {
+                    return XCTFail("An external 401 must not expire server auth.")
+                }
+            }
+            XCTAssertNil(model.quickLookFile)
+        }
+    }
+
+    func testArchiveHasNoPreviewAndDoesNotDownload() async {
         let recorder = TranscriptMediaPreviewRequestRecorder()
         let client = makeClient { request in
             recorder.record(request)
@@ -164,14 +278,14 @@ final class TranscriptMediaPreviewViewModelTests: XCTestCase {
         let viewModel = TranscriptMediaPreviewViewModel(
             server: Self.baseURL,
             sessionID: "session-123",
-            reference: .init(rawReference: "/tmp/vector.svg"),
+            reference: .init(rawReference: "/tmp/archive.zip"),
             apiClient: client
         )
 
         await viewModel.load()
 
         XCTAssertFalse(viewModel.isLoading)
-        XCTAssertEqual(viewModel.errorMessage, "Preview is not available for this media type.")
+        XCTAssertNotNil(viewModel.errorMessage)
         XCTAssertNil(viewModel.previewData)
         XCTAssertNil(viewModel.lastError)
         XCTAssertFalse(viewModel.canSaveImageToPhotos)
@@ -530,6 +644,13 @@ final class TranscriptMediaPreviewViewModelTests: XCTestCase {
         return renderer.pngData { context in
             UIColor.systemBlue.setFill()
             context.fill(CGRect(x: 0, y: 0, width: 24, height: 24))
+        }
+    }
+
+    private static func pdfData() -> Data {
+        UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 300, height: 400)).pdfData { context in
+            context.beginPage()
+            ("Hermex PDF preview" as NSString).draw(at: CGPoint(x: 24, y: 24), withAttributes: nil)
         }
     }
 

@@ -15,6 +15,7 @@ final class TranscriptMediaPreviewViewModel {
     private(set) var previewData: Data?
     private(set) var audioData: Data?
     private(set) var videoFileURL: URL?
+    private(set) var quickLookFile: QuickLookTemporaryFile?
     private(set) var originalByteCount: Int?
     private(set) var isLoading = false
     private(set) var errorMessage: String?
@@ -44,7 +45,8 @@ final class TranscriptMediaPreviewViewModel {
     }
 
     var canExportMedia: Bool {
-        originalData != nil
+        // A preview limit must not prevent an explicit file download/export.
+        originalData != nil || reference.binaryPreview == .quickLook
     }
 
     func load(force: Bool = false) async {
@@ -55,11 +57,12 @@ final class TranscriptMediaPreviewViewModel {
         previewData = nil
         audioData = nil
         videoFileURL = nil
+        quickLookFile = nil
         originalByteCount = nil
         originalData = nil
         removeTemporaryVideoFile()
 
-        guard reference.isRasterImageCandidate || reference.isVideoCandidate else {
+        guard reference.isRasterImageCandidate || reference.isVideoCandidate || reference.binaryPreview == .quickLook else {
             errorMessage = String(localized: "Preview is not available for this media type.")
             return
         }
@@ -74,6 +77,24 @@ final class TranscriptMediaPreviewViewModel {
         }
 
         do {
+            if reference.binaryPreview == .quickLook {
+                let loaded = try await FilePreviewContent.loadQuickLook(name: reference.displayName, knownSize: nil) {
+                    try await self.apiClient.transcriptMediaPreviewData(for: self.reference, sessionID: self.resolvedSessionID)
+                }
+                guard !Task.isCancelled, loadGeneration == generation else { return }
+                originalData = loaded.data
+                originalByteCount = loaded.data?.count
+                switch loaded.content {
+                case let .quickLook(file):
+                    quickLookFile = file
+                case let .unavailable(message):
+                    errorMessage = message
+                default:
+                    break
+                }
+                return
+            }
+
             let data = try await transcriptMediaData()
             guard !Task.isCancelled, loadGeneration == generation else { return }
             originalData = data
@@ -158,6 +179,7 @@ final class TranscriptMediaPreviewViewModel {
         loadGeneration += 1
         isLoading = false
         audioData = nil
+        quickLookFile = nil
         removeTemporaryVideoFile()
         videoFileURL = nil
     }
@@ -192,6 +214,10 @@ final class TranscriptMediaPreviewViewModel {
 
         if videoFileURL != nil {
             return .video
+        }
+
+        if reference.binaryPreview != nil {
+            return .data
         }
 
         return nil

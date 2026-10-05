@@ -672,8 +672,8 @@ struct ChatView: View {
     }
 
     /// An image is known to be an image before it is fetched, so it opens in the
-    /// full-bleed lightbox. Everything else keeps the preview sheet, which still has to
-    /// decide between audio, video, and an unsupported file once the bytes arrive.
+    /// full-bleed lightbox. Everything else keeps the preview sheet for audio,
+    /// video, Quick Look documents, or files that cannot be previewed.
     private func presentTranscriptMediaPreview(_ reference: TranscriptMediaReference) {
         presentPreviewRestoringComposerFocusIfNeeded {
             let item = TranscriptMediaPreviewItem(reference: reference)

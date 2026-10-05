@@ -172,6 +172,17 @@ actor APIClient {
         customHeaderProvider().apply(to: &request)
         request.setValue("*/*", forHTTPHeaderField: "Accept")
 
+        return try await boundedDownloadData(
+            for: request, using: session, limit: limit, mapsUnauthorized: true
+        )
+    }
+
+    private func boundedDownloadData(
+        for request: URLRequest,
+        using session: URLSession,
+        limit: Int,
+        mapsUnauthorized: Bool
+    ) async throws -> Data {
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do {
@@ -204,6 +215,10 @@ actor APIClient {
         }
         try buffer.append(chunk)
 
+        if !mapsUnauthorized, let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode == 401 {
+            throw APIError.http(statusCode: 401, body: String(data: buffer.data, encoding: .utf8))
+        }
         // Error bodies are read too: they carry the server's message, as with `sendData`.
         return try Self.mappedHTTPResponse(data: buffer.data, response: response, requireSuccess: true).0
     }
@@ -279,7 +294,8 @@ actor APIClient {
     func downloadData(
         from url: URL,
         using session: URLSession,
-        mapsUnauthorized: Bool
+        mapsUnauthorized: Bool,
+        limit: Int? = nil
     ) async throws -> Data {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -294,6 +310,12 @@ actor APIClient {
             customHeaderProvider().apply(to: &request)
         }
         request.setValue("*/*", forHTTPHeaderField: "Accept")
+
+        if let limit {
+            return try await boundedDownloadData(
+                for: request, using: session, limit: limit, mapsUnauthorized: mapsUnauthorized
+            )
+        }
 
         let data: Data
         let response: URLResponse
