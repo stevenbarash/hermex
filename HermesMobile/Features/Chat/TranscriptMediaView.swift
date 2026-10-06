@@ -428,71 +428,52 @@ private struct TranscriptMediaFileExportView: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            Button {
-                if let onPreview {
-                    onPreview()
-                } else {
-                    Task { await exportFile() }
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "doc")
-                        .font(.system(size: 16, weight: .semibold))
+        Button {
+            if let onPreview {
+                onPreview()
+            } else {
+                Task { await exportFile() }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "doc")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Color(.secondaryLabel))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(reference.displayName)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color(.label))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    Text(isExporting ? String(localized: "Loading…")
+                         : onPreview != nil ? String(localized: "Preview") : String(localized: "Tap to download"))
+                        .font(.caption2)
                         .foregroundStyle(Color(.secondaryLabel))
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(reference.displayName)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(Color(.label))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-
-                        Text(isExporting ? String(localized: "Loading…")
-                             : onPreview != nil ? String(localized: "Preview") : String(localized: "Tap to download"))
-                            .font(.caption2)
-                            .foregroundStyle(Color(.secondaryLabel))
-                            .lineLimit(1)
-                    }
-
-                    Spacer(minLength: 8)
-
-                    if onPreview == nil {
-                        Image(systemName: "square.and.arrow.down")
-                            .font(.system(size: 15, weight: .semibold))
-                    }
+                        .lineLimit(1)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.chatTactile(.thumbnail))
-            .accessibilityLabel(onPreview != nil
-                                ? String(localized: "Open \(reference.displayName)")
-                                : String(localized: "Download \(reference.displayName)"))
 
-            if onPreview != nil {
-                Button {
-                    Task { await exportFile() }
-                } label: {
-                    Image(systemName: "square.and.arrow.down")
-                        .font(.system(size: 15, weight: .semibold))
-                        .frame(minWidth: 44, minHeight: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.chatTactile(.thumbnail))
-                .accessibilityLabel(String(localized: "Download \(reference.displayName)"))
+                Spacer(minLength: 8)
+
+                Image(systemName: onPreview != nil ? "eye" : "square.and.arrow.down")
+                    .font(.system(size: 15, weight: .semibold))
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: 240, alignment: .leading)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color(.separator).opacity(0.35), lineWidth: 0.5)
+            )
         }
-        .frame(maxWidth: 240, alignment: .leading)
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(.separator).opacity(0.35), lineWidth: 0.5)
-        )
+        .buttonStyle(.chatTactile(.thumbnail))
         .disabled(isExporting)
+        .accessibilityLabel(onPreview != nil
+                            ? String(localized: "Open \(reference.displayName)")
+                            : String(localized: "Download \(reference.displayName)"))
         .fileExporter(
             isPresented: $isFileExporterPresented,
             document: exportDocument,
