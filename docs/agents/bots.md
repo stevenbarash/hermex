@@ -98,8 +98,9 @@ Connection Headers, for a proxy such as Cloudflare Access, are saved in the
 connection's own Keychain record (`BotConnection.headers`) and edited from the
 connection form with the shared `CustomHeadersEditor`. `HermesConnection` sends them,
 as `HermesHeaders`, on every request to its own origin: the public `/api/status`,
-sign-in, identity, ticket, REST and plugin calls, uploads, downloads and the `/api/ws`
-upgrade. The status probe sends them too, and the form signs its unsaved candidate in
+sign-in, identity, ticket, REST and plugin calls, uploads, downloads, and both socket
+upgrades: the gateway's `/api/ws` and the Kanban event socket (#1045), each on its own
+ticket. The status probe sends them too, and the form signs its unsaved candidate in
 with the form's set. A cross-origin redirect drops them before the push relay or any
 other host, and `PushRelayClient` never sees them. The policy refuses transport names
 (`Host`, `Cookie`, `Sec-WebSocket-*` and similar), the names Hermes reads for its own
@@ -791,6 +792,14 @@ the session cwd; that warning does not reject the prompt. The path remains
 available to agent tools. Actual document interpretation depends on the host's
 tools and file format.
 
+A sent prompt's bubble shows only the typed text, and Copy copies only that
+(`BotPrompt`, #1017). Each image pair or `@file:` block, read by the Sessions rule
+`MessageAttachment.hermesReferences`, becomes an attachment row under it, the same
+row and preview a reply's media uses: a thumbnail for an image, a file row for a
+document. Both download by the host path the reference names. An attachment-only
+prompt shows only its rows, which then carry the long-press menu. A block the
+rule does not read stays as text.
+
 These upload handlers were rechecked against installed Hermes Agent 0.21.2 source
 on 2026-09-14, together with prompt preprocessing and text-mode image routing.
 No live upload or prompt was executed. The compatibility pin is unchanged.
@@ -1050,6 +1059,52 @@ Reduce Motion keeps the eyes still, plays no bits and drops the squish. The firs
 is adaptive: `Color.botBody` paints it white in dark appearance and black in
 light, with eyes inverted to match, so the face and the swatch never vanish
 into the background.
+
+## Tasks on a Hermes host
+
+The Tasks screens run on a Hermes host through `HermesCronClient` (#1040), the
+`CronDataClient` beside webui's `APIClient`. It reads `GET /api/cron/jobs`, a bare array
+of every Profile's jobs, paused and completed included, and sends `POST /api/cron/jobs`,
+`PUT …/{id}` with `{updates}`, `POST …/{id}/pause` and `…/resume`, and `DELETE …/{id}`,
+each with the job's own `?profile=` (a hint the host checks). An update never names the
+job's id or Profile: the host can't move a job, so the editor locks the Profile. A 424
+on create is saved with the host's warning. Another 4xx shows the host's `detail`; a 403,
+502-504 or 520-530 never comes from Hermes and gets the connection's proxy or tunnel
+copy. Running state is a `fire_claim` or a
+`latest_execution` still `claimed` or `running`; recent runs are each job's `last_run_at`
+and `last_status`. The editor reads `GET /api/cron/delivery-targets?profile=` and
+`GET /api/skills?profile=` for the Task's Profile, and `model.options {profile}` and
+`profiles.list` over the gateway. The list warns once when any enabled Task's
+`scheduler_heartbeat_age_s` passes 180 s, three missed 60 s ticks. Jobs carry
+`hermes_home`, a host path, which is never decoded. Toast notifications are webui-only.
+The temporary entry is the inbox's + menu (DEBUG and Hermex Branch), until #709.
+
+Run Now (#1041) is `POST …/{id}/trigger?profile=`, which runs the job before it answers,
+so it gets the long deadline and goes out on its own task. `TaskDetailViewModel` then
+reads the list every 5 s until the host's outcome: the trigger's job, or a read where the
+Task no longer runs and its `last_run_at` is newer than before the tap. "Running" shows only
+once a read does. A 504, a 524, a timeout or a dropped connection keeps reading without an
+error, since the run outlives its request; a refusal (`{detail}`) shows unless a read right
+after it shows the Task running, as 409 "already running" does. Three failed reads in a row
+end it with the read's error, since the run's state is then unknown. Leaving the screen stops
+the reads, never the run, and nothing is resent. A paused Task asks first, because the trigger
+resumes it; a completed one has no Run Now, because the host refuses it. The list's row
+action runs the same machine and shows each list it reads, unless a change or a refresh
+landed on the list while that read was out.
+
+Run history (#1042) is `GET …/{id}/runs?profile=&limit=100`: the Task's newest 100 run
+sessions (`cron_<job>_<YYYYmmdd_HHMMSS>`), newest first, as one page with no offset or
+total, so there is no "Load more". A row decodes only its id, start and end, `is_active`,
+model, tokens and cost; never `system_prompt`, and not `preview`, which is the Task's prompt
+behind the scheduler's cron preamble on every run. A run's output is its session's final
+reply, the last assistant message without tool calls, from `GET /api/sessions/{id}/messages?profile=`;
+a 404 shows the run as unavailable. The host keeps one outcome per Task and stamps
+`last_run_at` once the run's session has ended, so the detail reads the job before its runs,
+and only the newest run that ended by `last_run_at` shows `last_status` and `last_error`. An
+`is_active` run shows running, and other runs claim nothing, as do runs read before a newer
+outcome (a finished Run Now's, or a refresh whose runs read failed) until the next read. The
+detail's latest output is that run's reply, read only when it failed. A page without its
+`runs` list is a failed read. Nothing reads `/api/fs/*`.
 
 ## Opening a bot from outside the app
 
@@ -1380,10 +1435,11 @@ prompt or mutation was executed.
 ## Slash suggestions
 
 Typing `/` at the start of a Bot Chat draft opens the slash panel with this
-connection's **skills**. Commands are deliberately absent: the gateway runs those
-only through `slash.exec` and `command.dispatch`'s quick/plugin/registry stages,
-which Bot Mode does not expose, so a command row would insert text nothing runs.
-Model, effort and workspace already have native controls (Chat controls above).
+connection's **skills**. Commands stay absent from Bot Chat until #1038: the
+gateway runs those only through `slash.exec` and `command.dispatch`'s
+quick/plugin/registry stages, which Bot Chat does not use yet, so a command row
+would insert text nothing runs. Model, effort and workspace already have native
+controls (Chat controls above). A Hermes chat runs commands (below).
 
 `commands.catalog {session_id}` (the live runtime id) is read once per
 conversation, after connecting, driven by the composer. `BotSlashCatalog` reads the `skills` keys for which entries
@@ -1423,7 +1479,56 @@ because the host projects the invocation back over the stored message
 
 `BotClient` allowlists `commands.catalog` (exactly `session_id`) and `command.dispatch`
 (exactly `name`, `arg`, `session_id`; a bare name with no slash or whitespace) as
-its third typed exception. `slash.exec` stays unsupported.
+its third typed exception.
+
+### Hermes chats (#1036)
+
+A Hermes chat's panel lists its host's whole `commands.catalog`, as Hermes Desktop
+and the CLI do: built-ins (Hermes-only ones such as `/context` included), the
+user's `quick_commands`, plugin commands and skills. `HermesSlashCatalog` reads
+the command rows as the `pairs` keys `canon` knows, attaches each command's
+aliases from `canon` (so `/ctx` finds `/context`), and keeps skills apart through
+`BotSlashCatalog.skills`. `HermesSlashCommands` reads it on every connect with the
+runtime's `session_id`; a reply for an older attach is dropped, a failed read
+keeps the last list (the panel shows Hermex's own commands until one answers),
+and nothing is persisted or crosses servers.
+
+The panel ranks on the phone. Only a host command's argument stage asks the
+host: `complete.slash {text, session_id}` with the draft up to the caret, about
+150 ms after typing stops, newest reply only, cancelled when the caret leaves.
+The panel shows its rows only while the host has suggestions; a pick replaces
+from `replace_from`.
+
+Send resolves a draft that opens with `/name` in this order:
+
+1. **Hermex's own** (`SlashCommandCatalog.hermesCommands`): `/new`, `/stop`,
+   `/model`, `/reasoning`, `/personality`, `/goal`, `/btw`, `/bg` and
+   `/background`, and `/yolo` (the session's `config.set yolo`). Each keeps its
+   native path; an alias such as `/reset` resolves to its command first.
+2. **Held until #702 slice 2.3** (`hermesHeldNames`): `/compress`, `/compact`,
+   `/undo`, `/retry`, `/clear`, `/branch`, `/fork`, `/title`, `/resume`,
+   `/sessions`. They rewrite history or move between chats, so they show a notice
+   naming #702 and send nothing.
+3. **A catalog skill**: `command.dispatch` expands it and `message` is submitted.
+4. **Any other catalog command or alias**: `slash.exec {session_id, command}`
+   with the typed line, once.
+5. **Anything else** is sent as typed.
+
+`slash.exec` answers `{output, warning?}` or a directive. Output, warnings and
+notices show as a local notice (pinned while a turn runs), the output in a code
+block so its line breaks survive. `send` and `skill` submit `message` through
+the normal send path, so a running turn queues it; `prefill` replaces the draft;
+`alias` runs its target once with the typed argument, and a second alias is
+refused. A refusal shows the host's message and keeps the draft; in a chat with
+nothing sent yet it says to send a message first. A command can run in the
+host's slash worker for up to 45 s, so `slash.exec` waits twice the usual
+deadline and its timeout fails only that command, never the chat's connection.
+
+`/yolo` stays Hermex's own because a worker-run `/yolo` changes only the slash
+worker: only `model`, `approvals`, `personality`, `prompt`, `compress`, `fast`,
+`reload-mcp` and `stop` mirror back into the live session (`_SLASH_MIRRORS`).
+At the pin, an unsent chat's `/context` answers "No active agent -- send a
+message first." as plain output.
 
 Group rooms are out of scope: `BotRoomComposerView` is a separate composer and
 does not get the panel.
@@ -1431,7 +1536,7 @@ does not get the panel.
 Contract checked against the `HERMES_AGENT_TESTED_SHA` pin (`3abeca16`, 0.21.2):
 `tui_gateway/methods_tools.py` (`commands.catalog`, `command.dispatch`,
 `_dispatch_quick`/`_dispatch_skill`), `tui_gateway/methods_complete.py`
-(`complete.slash`, a per-keystroke read the catalog replaces) and
+(`complete.slash`, which the catalog replaces at the command stage) and
 `tui_gateway/session_history.py` (`_skill_scaffold_projection`). At 0.21.4
 (`d337b736`) `commands.catalog` binds skill discovery to the session it is given
 (`_session_home_scope`), so the phone passes the runtime id and the list follows
@@ -1479,12 +1584,29 @@ and `deferred` determine whether to request confirmation, show a next-turn pick,
 or re-read the active model. No pending pick gets an active checkmark. Reads are
 coalesced on session-info, turn-boundary and session-control events, never polled.
 
+The catalog projection is `HermesModelCatalog`, shared with a Hermes session's
+composer in the main chat (#1015). That composer reuses `BotChatControls` for its
+model chip without the `session.control.read` its side tasks already make
+(`HermesChatSettings`), and lists `profiles.list` in its Profile chip. Picking
+another Profile opens a new chat in it; the session's Profile never changes.
+
 Reasoning and fast mode use `config.set` with `{profile, session_id, scope:
 "session", key, value}`. Reasoning sends only `none`, `minimal`, `low`, `medium`,
 `high`, `xhigh`, `max` or `ultra` (never the host's display commands). Fast sends
 `fast` or `normal`, never a retry-sensitive toggle. Matching `key`/`value` replies
 acknowledge the selection; rejections preserve the old value. Both choices are
 bound to the captured runtime and active model, and are invalidated on disconnect.
+
+A Hermes session's composer (#1016) offers the same ladder, without `none` when
+`capabilities[model].can_disable_reasoning` is false, and hides it for
+`reasoning: false`. Effort is session-scoped: the next chat in the Profile keeps
+its own. `session.info.reasoning_effort_wire` names the level the model's route
+actually takes; the chip shows it when it differs ("XHigh · sent as High").
+`/reasoning` there refuses the display words. Personality is the opposite:
+`config.set {key: "personality"}` always writes the Profile's default (the host
+has no session-only personality) and also switches the session, so
+`/personality <name>` asks first and names the Profile. Its list is
+`complete.slash {text: "/personality ", session_id}`.
 
 **Accepted host limitation (#479):** in the compatibility pin's
 `tui_gateway/methods_config_set.py`, `_set_reasoning` and `_set_fast` fall back to

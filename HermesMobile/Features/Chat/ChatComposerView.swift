@@ -269,10 +269,25 @@ struct MessageComposerView: View {
     let onSelectGitBranch: (GitCheckoutTarget) -> Void
     let onCreateGitBranch: (GitCheckoutTarget) -> Void
     let onRefreshGitBranches: () -> Void
-    /// False on a Hermes session (#1010): the model, workspace and Profile selectors, the
-    /// branch picker, voice notes and the `/` panel stay hidden until their phases land.
-    /// The + menu, dictation and the context indicator stay.
+    /// False on a Hermes session (#1010): the workspace selector, the branch picker and voice
+    /// notes stay hidden until their phases land. The + menu, dictation and the context
+    /// indicator stay.
     var showsSessionControls = true
+    /// The commands the `/` panel lists and runs: a Hermes chat's own and its host's (#1036).
+    var slashScope = SlashCommandScope.webui
+    /// The host's suggestions for a host command's argument (#1036).
+    var hostSlashCompletion: HermesSlashCompletion?
+    /// Asks the host to complete a host command's argument: the draft up to the caret, or nil
+    /// once the caret leaves one. Called again on each change; a newer call replaces it.
+    var onCompleteHostSlashArgument: (String?) async -> Void = { _ in }
+    /// A Hermes session's model and Profile chips (#1015), shown while the rest of
+    /// `showsSessionControls` stays hidden.
+    var showsModelAndProfileControls = false
+    /// A configuration change that has not landed yet, such as a model the host applies
+    /// after the running response. Shown below any configuration error.
+    var configurationNotice: String?
+    /// The effort a Hermes host sends when the model takes less than the one picked (#1016).
+    var sentReasoningEffort: String?
     /// A Hermes session (#1012): staged files upload when they are sent, under Bot Chat's
     /// rules. Up to eight, and Steer drops out while a response runs.
     var uploadsAttachmentsOnSend = false
@@ -325,7 +340,15 @@ struct MessageComposerView: View {
     /// The `/…` the caret is sitting in, whether that is the start of the draft
     /// or the middle of a sentence.
     private var slashTrigger: ComposerSlashTrigger? {
-        ComposerSlashTrigger.detect(in: draftMessage, selection: composerSelection.range)
+        ComposerSlashTrigger.detect(in: draftMessage, selection: composerSelection.range, scope: slashScope)
+    }
+
+    /// The draft up to the caret while it is at a host command's argument (#1036), which the
+    /// host is asked to complete.
+    private var hostSlashArgumentText: String? {
+        guard fileTrigger == nil, let trigger = slashTrigger, trigger.startsDraft,
+              ParsedSlashQuery(query: trigger.text, scope: slashScope).isHostArgumentMode else { return nil }
+        return trigger.text
     }
 
     /// The `@…` the caret is sitting in, or `nil` when there is none.
@@ -360,12 +383,19 @@ struct MessageComposerView: View {
     /// `ComposerSlashTrigger` ends at the space after a command that takes no
     /// sub-argument — so besides the trigger itself, three things close the
     /// panel: a settled `/skills` invocation, a settled goal action, and a
-    /// mid-sentence word no loaded skill matches.
+    /// mid-sentence word no loaded skill matches. A Hermes chat's panel opens only at the
+    /// start of the draft, where its host runs a command, and at a host command's argument
+    /// only while the host has suggestions for it (#1036).
     private var slashQuery: String? {
-        guard showsSessionControls, fileTrigger == nil, let query = slashTrigger?.text else { return nil }
+        guard fileTrigger == nil, let query = slashTrigger?.text else { return nil }
 
-        let parsed = ParsedSlashQuery(query: query)
-        if parsed.commandName.lowercased() == "skills",
+        let parsed = ParsedSlashQuery(query: query, scope: slashScope)
+        if slashScope.isHermes {
+            guard slashTrigger?.startsDraft == true else { return nil }
+            if parsed.isHostArgumentMode,
+               hostSlashCompletion.map({ $0.items.isEmpty || !$0.applies(to: query) }) ?? true { return nil }
+        }
+        if parsed.command?.subArgs == .skills,
            SlashSkillFormatter.invocation(from: parsed.argQuery, suggestions: skillSuggestions) != nil {
             return nil
         }
@@ -453,7 +483,7 @@ struct MessageComposerView: View {
     }
 
     private var parsedSlashQuery: ParsedSlashQuery {
-        ParsedSlashQuery(query: slashQuery ?? "")
+        ParsedSlashQuery(query: slashQuery ?? "", scope: slashScope)
     }
 
     private var slashAutocompleteLoadKey: String {
@@ -530,6 +560,10 @@ struct MessageComposerView: View {
                             agentCommands: agentCommands,
                             skillsOnly: showsSlashAutocompleteSkillsOnly,
                             selectedReasoningEffort: selectedReasoningEffort,
+                            scope: slashScope,
+                            reasoningLevels: slashScope.isHermes
+                                ? supportedReasoningEfforts ?? [] : SlashCommandCatalog.reasoningLevels,
+                            hostCompletion: hostSlashCompletion,
                             onSelectCommand: { command in
                                 pickCompletion("/\(command.name) ")
                             },
@@ -544,6 +578,12 @@ struct MessageComposerView: View {
                             },
                             onSelectSubArg: { subArg in
                                 pickCompletion("/\(parsedSlashQuery.commandName) \(subArg)")
+                            },
+                            onSelectHostArgument: { item in
+                                if let completion = hostSlashCompletion, let trigger = slashTrigger,
+                                   completion.applies(to: trigger.text) {
+                                    pickCompletion(completion.applying(item))
+                                }
                             },
                             onDismiss: {
                                 applyCompletion("")
@@ -652,6 +692,9 @@ struct MessageComposerView: View {
         }
         .task(id: slashAutocompleteLoadKey) {
             await loadSlashAutocompleteSubArgsIfNeeded()
+        }
+        .task(id: hostSlashArgumentText) {
+            await onCompleteHostSlashArgument(hostSlashArgumentText)
         }
         .task(id: AppLock.shared.isLocked) {
             // Cold path: the composer appears already active (the usual case for the
@@ -925,14 +968,14 @@ struct MessageComposerView: View {
             ComposerToolbarScroller {
                 composerPlusMenu
 
-                if showsSessionControls {
+                if showsSessionControls || showsModelAndProfileControls {
                     modelEffortControl
 
-                    workspaceSelector
+                    if showsSessionControls { workspaceSelector }
 
                     profileSelector
 
-                    gitBranchPicker
+                    if showsSessionControls { gitBranchPicker }
                 }
 
                 voiceControlButton
@@ -1193,7 +1236,8 @@ struct MessageComposerView: View {
             model: selectedModelOption,
             effort: selectedReasoningEffort,
             supportedEfforts: supportedReasoningEfforts,
-            supportsEffort: showsReasoningControl ? supportsReasoningEffort : false
+            supportsEffort: showsReasoningControl ? supportsReasoningEffort : false,
+            sentEffort: sentReasoningEffort
         )
     }
 
@@ -1244,6 +1288,8 @@ struct MessageComposerView: View {
             return (errorMessage, true, false, nil, errorFixPrompt, nil)
         } else if let configurationErrorMessage {
             return (configurationErrorMessage, true, false, nil, nil, nil)
+        } else if let configurationNotice {
+            return (configurationNotice, false, false, nil, nil, nil)
         } else if isUpdatingConfiguration {
             return (String(localized: "Updating composer settings..."), false, false, nil, nil, nil)
         }

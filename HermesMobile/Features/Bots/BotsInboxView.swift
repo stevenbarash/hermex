@@ -1,8 +1,9 @@
 import SwiftUI
 
 /// Whether the inbox's + menu offers "New Session" (#1010), which opens a Hermes session in
-/// the main chat: only as a Hermes server's home, and only in a DEBUG build or Hermex Branch
-/// (bundle id ending `.branch`). Temporary: #709's Sessions tab replaces it.
+/// the main chat, "Tasks" (#1040), the host's scheduled Tasks, and "Kanban" (#1043), which opens
+/// the host's Boards: only as a Hermes server's home, and only in a DEBUG build or Hermex Branch
+/// (bundle id ending `.branch`). Temporary: #709's build gives them a permanent home.
 enum HermesSessionEntry {
     static func isOffered(isHermesHome: Bool, isDebugBuild: Bool = HermesSessionEntry.isDebugBuild,
                           bundleIdentifier: String? = Bundle.main.bundleIdentifier) -> Bool {
@@ -16,6 +17,18 @@ enum HermesSessionEntry {
         return false
         #endif
     }
+}
+
+/// The Tasks screen the inbox's + menu pushed on a Hermes host (#1040), with the client it
+/// reads through and the Profile a new Task starts in.
+struct HermesTasksEntry: Hashable, Identifiable {
+    let id = UUID()
+    let server: URL
+    let client: HermesCronClient
+    let newTaskProfile: String
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 /// What titles the Bots inbox as a Hermes server's home: the server's name, and its host
@@ -66,9 +79,13 @@ struct BotsInboxHome {
     /// True once `open()` has returned at least once, so "no Bot connection" is a
     /// settled answer to a held deep link rather than a not-loaded-yet one.
     @State private var hasSettled = false
-    /// The Hermes session "New Session" pushed, and whether its Profile is being read.
+    /// The Hermes session "New Session" pushed, the Tasks screen "Tasks" pushed, and whether
+    /// the Profile either starts in is being read.
     @State private var newSession: HermesSessionChat?
+    @State private var tasks: HermesTasksEntry?
     @State private var isOpeningSession = false
+    /// True while the host's Kanban is pushed from the + menu (#1043).
+    @State private var showingKanban = false
 
     init(
         server: URL,
@@ -218,9 +235,22 @@ struct BotsInboxHome {
                     }
                     .disabled(!inbox.roomCapabilities.enabled || !inbox.roomCapabilities.methods.contains("groups.create"))
                     if HermesSessionEntry.isOffered(isHermesHome: home != nil) {
-                        // Temporary entry until #709's Sessions tab replaces it.
-                        Button("New Session", systemImage: "square.and.pencil", action: openNewSession)
-                            .disabled(isOpeningSession)
+                        // Temporary entries until #709's build replaces them.
+                        Button("New Session", systemImage: "square.and.pencil") {
+                            openOnSelectedProfile { connection, profile in
+                                newSession = HermesSessionChat(server: server, connection: connection,
+                                                               target: .new(profile: profile))
+                            }
+                        }
+                        .disabled(isOpeningSession)
+                        Button("Tasks", systemImage: "calendar.badge.clock") {
+                            openOnSelectedProfile { connection, profile in
+                                tasks = HermesTasksEntry(server: server, client: HermesCronClient(saved: connection, server: server),
+                                                         newTaskProfile: profile)
+                            }
+                        }
+                        .disabled(isOpeningSession)
+                        Button("Kanban", systemImage: "rectangle.split.3x1") { showingKanban = true }
                     }
                     if inbox.reorderableSectionNames.count >= 2 {
                         Divider()
@@ -342,17 +372,20 @@ struct BotsInboxHome {
         .padding(.vertical, 12)
     }
 
-    /// Pushes a new Hermes session on the Profile the host's dashboard runs (`current`).
-    /// The session is created when the chat attaches, not here.
-    private func openNewSession() {
+    /// Opens a new Hermes session, or the Tasks screen, on the Profile last picked for this
+    /// server, or the one the host's dashboard runs (`current`) when none is, or the host no
+    /// longer lists it (#1015). A session is created when its chat attaches, not here; a new
+    /// Task starts in that Profile (#1040).
+    private func openOnSelectedProfile(_ open: @escaping (BotConnection, String) -> Void) {
         guard let connection = inbox.connection, !isOpeningSession else { return }
         isOpeningSession = true
         Task {
             defer { isOpeningSession = false }
             do {
-                let profile = try await inbox.currentProfile()
+                let current = try await inbox.currentProfile()
                 guard inbox.connection?.id == connection.id else { return }
-                newSession = HermesSessionChat(server: server, connection: connection, target: .new(profile: profile))
+                open(connection, HermesProfilePreference.resolve(for: server, listed: inbox.profiles.map(\.id),
+                                                                 current: current))
             } catch {
                 toast = BotConnectionAdvice.message(for: error, address: connection.address)
             }
@@ -589,7 +622,8 @@ extension BotsInboxView {
                 searchedProfile = nil
                 searchedRoom = nil; searchedSequence = nil; roomSequence = nil
                 selection.room = nil; selection.conversation = nil
-                newSession = nil
+                newSession = nil; tasks = nil
+                showingKanban = false
                 editSelection = nil
                 creation = nil
                 roomCreator?.suspend(); roomCreator = nil; createdRoom = nil
@@ -624,7 +658,22 @@ extension BotsInboxView {
             .navigationDestination(item: $editSelection) { selection in
                 editProfile(selection)
             }
-            .navigationDestination(item: $newSession) { ChatView(hermesSession: $0) }
+            // Keyed by the chat, so a Profile picked before sending replaces the screen's
+            // state rather than reusing it (#1015).
+            .navigationDestination(item: $newSession) { chat in
+                ChatView(hermesSession: chat) { newSession = $0 }.id(chat.id)
+            }
+            .navigationDestination(item: $tasks) { entry in
+                TasksView(server: entry.server, onAPIError: { _ in }, client: entry.client,
+                          newTaskProfile: entry.newTaskProfile)
+                    .id(entry.id)
+            }
+            .navigationDestination(isPresented: $showingKanban) {
+                if let connection = inbox.connection {
+                    KanbanView(server: server, hermes: HermesConnections.shared.connection(for: connection, server: server))
+                        .id(connection.id)
+                }
+            }
             // The subscription lives while the inbox is on screen and the app is not in the
             // background; returning, refreshing and reconnecting all go through the same open().
             .task(id: revision) { await inbox.open(); hasSettled = true; openPendingDestination() }

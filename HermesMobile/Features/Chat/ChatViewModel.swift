@@ -462,8 +462,10 @@ final class ChatViewModel {
     /// Drops out-of-order `GET /api/reasoning` responses after rapid model switches
     /// so the gating never reflects a stale model (upstream #3750 class of bug).
     private var reasoningGatingFetchToken = 0
+    /// A Hermes session shows it unless the host marks the model `reasoning: false` (#1016).
     var showsReasoningEffortControl: Bool {
-        ReasoningEffortOption.showsEffortControl(
+        if let hermesSettings { return hermesSettings.showsEffort }
+        return ReasoningEffortOption.showsEffortControl(
             supportsReasoningEffort: supportsReasoningEffort,
             supportedEfforts: supportedReasoningEfforts
         )
@@ -682,6 +684,8 @@ final class ChatViewModel {
         case .hermes(let coordinator):
             hermesTurn = coordinator
             turn = coordinator
+            currentProfile = coordinator.settings.profile
+            selectedProfileName = coordinator.settings.profile
             coordinator.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
         }
         self.drafts = draftStore ?? .shared
@@ -760,13 +764,51 @@ final class ChatViewModel {
         let usedSnapshotMessagesOffset: Bool
     }
 
+    /// A Hermes session's model chip shows `model.options`' live model, or the pick
+    /// waiting on the running response (#1015); `session.info`'s model until it answers.
     var selectedModelID: String? {
-        currentModel
+        hermesSettings?.selectedModel?.id ?? currentModel
     }
 
     var selectedModelProviderID: String? {
-        currentModelProvider
+        hermesSettings.map { $0.selectedModel?.providerID } ?? currentModelProvider
     }
+
+    /// The model picker's groups: a Hermes session's `model.options` (#1015), else webui's catalog.
+    var composerModelGroups: [ModelCatalogGroup] {
+        hermesSettings?.controls.catalog.groups ?? modelCatalogGroups
+    }
+
+    /// The Profile chip's list: a Hermes host's `profiles.list` (#1015), else webui's Profiles.
+    var composerProfileOptions: [ProfileSummary] {
+        hermesSettings?.profileOptions ?? profileOptions
+    }
+
+    var composerIsSingleProfileMode: Bool {
+        hermesSettings.map { $0.profiles.count <= 1 } ?? isSingleProfileMode
+    }
+
+    /// A Hermes model pick the host applies after the running response (#1015).
+    var composerConfigurationNotice: String? {
+        guard let pending = hermesSettings?.controls.pendingModel else { return nil }
+        return String(localized: "Switches to \(pending.displayName) after this response.")
+    }
+
+    /// A Hermes session's model and Profile controls (#1015). Nil on a webui session.
+    var hermesSettings: HermesChatSettings? { hermesTurn?.settings }
+
+    /// The effort chip's level: a Hermes session's `session.info` effort (#1016), else webui's.
+    var composerReasoningEffort: String? {
+        hermesSettings.map { $0.controls.effort } ?? selectedReasoningEffort
+    }
+
+    /// The effort ladder: a Hermes host's for the live model (#1016), else webui's vocabulary.
+    var composerSupportedReasoningEfforts: [String]? {
+        hermesSettings?.effortLevels ?? supportedReasoningEfforts
+    }
+
+    /// The level a Hermes host sends when the model takes less than the one picked (#1016).
+    var composerSentReasoningEffort: String? { hermesSettings?.sentEffort }
 
     var selectedWorkspacePath: String? {
         currentWorkspace
@@ -778,7 +820,7 @@ final class ChatViewModel {
             return String(localized: "Profile")
         }
 
-        if let option = profileOptions.first(where: { $0.name == profileName }) {
+        if let option = composerProfileOptions.first(where: { $0.name == profileName }) {
             return option.displayName
         }
 
@@ -786,16 +828,16 @@ final class ChatViewModel {
     }
 
     var selectedModelTitle: String {
-        guard let currentModel, !currentModel.isEmpty else {
+        guard let model = selectedModelID, !model.isEmpty else {
             return String(localized: "Model")
         }
 
-        let catalogName = modelCatalogGroups
+        let catalogName = composerModelGroups
             .flatMap(\.allModels)
-            .firstMatchingSelection(modelID: currentModel, providerID: currentModelProvider)?
+            .firstMatchingSelection(modelID: selectedModelID, providerID: selectedModelProviderID)?
             .displayName
 
-        return catalogName ?? Self.compactModelTitle(currentModel)
+        return catalogName ?? Self.compactModelTitle(model)
     }
 
     func isSelectedProfile(_ profile: ProfileSummary) -> Bool {
@@ -922,7 +964,7 @@ final class ChatViewModel {
     }
 
     func loadComposerConfiguration() async {
-        // A Hermes session runs its Profile's own model and settings until #705 adds them.
+        // A Hermes session's chips read its gateway (`HermesChatSettings`), never webui's routes.
         guard hermesTurn == nil else { return }
         if isLoadingComposerConfiguration {
             needsComposerConfigurationReload = true
@@ -960,6 +1002,10 @@ final class ChatViewModel {
     /// the active provider's live list from `/api/models/live`. Failures are
     /// silent by design — the picker keeps whatever it already shows.
     func refreshModelCatalogForPickerOpen() async {
+        if let hermesSettings {
+            await hermesSettings.controls.reload()
+            return
+        }
         if let response = try? await client.models() {
             let groups = response.catalogGroups
             if !groups.isEmpty {
@@ -1019,6 +1065,9 @@ final class ChatViewModel {
     ) async -> Bool {
         if recordsInteraction {
             composerConfigurationInteractionGeneration &+= 1
+        }
+        if let hermesSettings {
+            return await hermesSettings.select(option)
         }
         guard !option.matchesSelection(modelID: currentModel, providerID: currentModelProvider) else {
             return false
@@ -1145,6 +1194,13 @@ final class ChatViewModel {
     /// next caller retries.
     func loadPersonalitySuggestions() async {
         guard !hasLoadedPersonalitySuggestions else { return }
+        // A Hermes host lists its own (#1016), here for the `/personality ` panel (#1036).
+        if let hermesSettings {
+            guard let personalities = try? await hermesSettings.personalities() else { return }
+            personalitySuggestions = ["none"] + personalities.map(\.name)
+            hasLoadedPersonalitySuggestions = true
+            return
+        }
 
         let load: Task<Void, Never>
         if let existing = personalitySuggestionsLoad {
@@ -1347,6 +1403,12 @@ final class ChatViewModel {
         let selectedEffort = effort.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !selectedEffort.isEmpty else { return false }
 
+        // A Hermes session sends it for this chat alone, as Bot Chat does (#1016).
+        if let hermesSettings {
+            guard selectedEffort != hermesSettings.controls.effort else { return false }
+            return await hermesSettings.select(effort: selectedEffort)
+        }
+
         guard selectedEffort != selectedReasoningEffort else {
             return false
         }
@@ -1499,9 +1561,26 @@ final class ChatViewModel {
         attachmentCoordinator.setUploadAttachmentError(message)
     }
 
+    /// A sent attachment's thumbnail bytes: a Hermes session downloads from its host
+    /// (#1030), a webui chat through the server's file API. Nil when it can't load.
     func attachmentImageData(path: String) async -> Data? {
-        await attachmentCoordinator.attachmentImageData(path: path)
+        guard let hermesTurn else { return await attachmentCoordinator.attachmentImageData(path: path) }
+        guard let data = try? await hermesTurn.attachmentData(path: path) else { return nil }
+        return await ImagePreviewDownsampler.previewDataAsync(
+            from: data,
+            maxPixelSize: ImagePreviewDownsampler.attachmentMaxPixelSize
+        ) ?? data
     }
+
+    /// A Hermes session's sent file in full, for its preview (#1030). Throws `.stale` on a
+    /// webui chat, which previews through `ChatAttachmentPreviewView` instead.
+    func hermesAttachmentData(path: String) async throws -> Data {
+        guard let hermesTurn else { throw BotFailure.stale }
+        return try await hermesTurn.attachmentData(path: path)
+    }
+
+    /// The thumbnail cache namespace of a Hermes session; nil on a webui chat.
+    var hermesAttachmentCacheNamespace: String? { hermesTurn?.attachmentCacheNamespace }
 
     func attachmentRawData(path: String) async -> Data? {
         await attachmentCoordinator.attachmentRawData(path: path)
@@ -2604,6 +2683,21 @@ final class ChatViewModel {
     /// webui session.
     var hermesSideTasks: HermesChatSideTasks? { hermesTurn?.sideTasks }
 
+    /// A new chat in `profile` on this Hermes session's server and connection (#1015).
+    func newHermesSessionChat(profile: String) -> HermesSessionChat? {
+        hermesTurn.map { HermesSessionChat(server: $0.engine.server, connection: $0.engine.connection,
+                                           target: .new(profile: profile)) }
+    }
+
+    /// Moves this new Hermes chat's draft, files included, to `chat`, which replaces it. A
+    /// draft already waiting in that Profile's new chat stays, and this one keeps its key.
+    func handOffHermesDraft(to chat: HermesSessionChat) async {
+        guard let key = hermesDraftKey else { return }
+        let target = chat.target.draftKey(server: chat.server, connectionID: chat.connection.id)
+        guard await drafts.draft(for: target) == nil else { return }
+        drafts.moveDraft(from: key, to: target)
+    }
+
     /// Who asks in a Hermes session's request card: its Profile on its saved connection.
     var hermesRequestIdentity: String? {
         hermesTurn.map { String(localized: "\($0.engine.target.profile) on \($0.engine.connection.name)") }
@@ -3195,6 +3289,9 @@ final class ChatViewModel {
                 await cancelActiveStream()
                 return .executed(message: nil)
             case .new:
+                if let hermesTurn {
+                    return newHermesSessionChat(profile: hermesTurn.settings.profile).map { .openedHermesSession($0) } ?? .notDelivered
+                }
                 return await createSessionFromSlashCommand()
             case .help:
                 return .executed(message: Self.slashCommandHelpText)
@@ -3245,6 +3342,8 @@ final class ChatViewModel {
             return await startBackgroundFromSlashCommand(args)
         case .goal:
             return await submitGoalFromSlashCommand(args)
+        case .yolo:
+            return await toggleHermesApprovalBypassFromSlashCommand()
         }
     }
 
@@ -3572,6 +3671,126 @@ final class ChatViewModel {
         return .notDelivered
     }
 
+    // MARK: Hermes slash commands
+
+    /// The host's slash commands in a Hermes chat (#1036); nil on webui.
+    var hermesSlashCommands: HermesSlashCommands? { hermesTurn?.slashCommands }
+
+    /// The agent commands the composer offers: a Hermes host's catalog, or webui's list.
+    var composerAgentCommands: [AgentCommand] {
+        hermesTurn?.slashCommands.catalog.commands ?? agentCommands
+    }
+
+    /// The skills the composer offers: a Hermes host's catalog, or webui's list.
+    var composerSkillSuggestions: [SkillSlashSuggestion] {
+        hermesTurn?.slashCommands.catalog.skills ?? skillSlashSuggestions
+    }
+
+    /// Runs a Hermes chat's draft that opens with `/name` (#1036): Hermex's own command, the
+    /// #702 notice for a held one, a skill's expansion, or the host's `slash.exec`. Nil when
+    /// the name is no command this chat or its host knows, so the draft is sent as typed.
+    func runHermesSlashCommand(_ draft: String, modelContext: ModelContext? = nil) async -> SlashCommandExecutionResult? {
+        guard let hermesTurn, let invocation = BotSlashCatalog.invocation(in: draft) else { return nil }
+        return await runHermesSlashCommand(invocation, line: draft.trimmingCharacters(in: .whitespacesAndNewlines),
+                                           on: hermesTurn, followsAlias: false, modelContext: modelContext)
+    }
+
+    private func runHermesSlashCommand(
+        _ invocation: BotSlashInvocation,
+        line: String,
+        on hermes: HermesChatTurnCoordinator,
+        followsAlias: Bool,
+        modelContext: ModelContext?
+    ) async -> SlashCommandExecutionResult? {
+        let slash = hermes.slashCommands
+        let name = invocation.name
+        let reply: HermesSlashReply
+        do {
+            switch slash.route(name) {
+            case .appOwned(let command):
+                return await executeSlashCommand(command, args: invocation.argument, modelContext: modelContext)
+            case .held:
+                return .unsupported(friendlyMessage: String(localized: "Hermex can't run /\(name) in a Hermes chat yet (#702)."))
+            case .skill(let skill):
+                reply = try await slash.expand(skill, argument: invocation.argument, typed: line)
+            case .text where !followsAlias:
+                return nil
+            case .host, .text:
+                guard !line.contains(where: \.isNewline) else {
+                    return notDelivered(String(localized: "Run /\(name) on one line."))
+                }
+                reply = try await slash.run(line)
+            }
+        } catch {
+            return hermesSlashFailure(error, name: name)
+        }
+
+        switch reply {
+        case .notice(let text):
+            notifyLocally(text)
+            return .executed(message: nil)
+        case .send(let message, let shown, let notice):
+            if let notice { notifyLocally(notice) }
+            // A running turn queues it, as any send does.
+            let mode: BotPromptMode = activeStreamID == nil ? .send : .queue
+            return await submitHermesPrompt(message, mode: mode, to: hermes, shown: shown) ? .executed(message: nil) : .notDelivered
+        case .prefill(let message, let notice):
+            if let notice { notifyLocally(notice) }
+            return .prefill(message)
+        case .alias(let target):
+            // Run once, with the typed argument; an alias to another alias is refused.
+            let line = invocation.argument.isEmpty ? "/\(target)" : "/\(target) \(invocation.argument)"
+            guard !followsAlias, let next = BotSlashCatalog.invocation(in: line) else {
+                return notDelivered(String(localized: "/\(name) points to another alias, so Hermex didn't run it."))
+            }
+            return await runHermesSlashCommand(next, line: line, on: hermes, followsAlias: true, modelContext: modelContext)
+        }
+    }
+
+    /// Why a Hermes slash command did not run. The draft stays. A refusal is the host's own
+    /// message, except in a chat with nothing sent yet, where there is nothing to run it on.
+    private func hermesSlashFailure(_ error: Error, name: String) -> SlashCommandExecutionResult {
+        switch error {
+        case is HermesChatTurnCoordinator.NotSent:
+            return notDelivered(String(localized: "Reconnect to the server to run /\(name)."))
+        case BotSettingFailure.rejected(_, let message):
+            guard messages.contains(where: { $0.role == "user" }) else {
+                return notDelivered(String(localized: "Send a message first, then run /\(name)."))
+            }
+            return notDelivered(message)
+        case BotFailure.rejected:
+            return notDelivered(String(localized: "Hermes did not accept /\(name)."))
+        default:
+            return notDelivered(String(localized: "Hermes did not confirm /\(name). Check before running it again."))
+        }
+    }
+
+    /// A notice in the transcript, or pinned above the composer while a turn runs.
+    private func notifyLocally(_ text: String) {
+        if activeStreamID == nil { appendLocalNoticeMessage(text) } else { pinLocalNoticeMessage(text) }
+    }
+
+    /// `/yolo` in a Hermes chat (#1036): this session's approval bypass, through the same
+    /// `config.set yolo` as the approval card's Skip all and the bypass pill.
+    private func toggleHermesApprovalBypassFromSlashCommand() async -> SlashCommandExecutionResult {
+        guard let requests = hermesRequests else {
+            return .unsupported(friendlyMessage: SlashCommandExecutor.unsupportedMessage(for: "yolo"))
+        }
+        if requests.approvalBypass, !requests.mayTurnOffApprovalBypass {
+            return notDelivered(String(localized: "This Hermes host approves every command itself, so approvals can't be turned back on from here."))
+        }
+        sendErrorMessage = nil
+        guard let enabled = await requests.toggleApprovalBypass() else {
+            return sendErrorMessage == nil
+                ? notDelivered(String(localized: "Reconnect to the server to run /\("yolo")."))
+                : .notDelivered
+        }
+        notifyLocally(enabled
+                      ? String(localized: "Approvals are skipped in this chat. Run /yolo again to turn them back on.")
+                      : String(localized: "Approvals are back on in this chat."))
+        return .executed(message: nil)
+    }
+
     /// A typed `/goal`. On failure a Hermes session keeps the draft, as its sends do (#1013),
     /// with the status line `submitGoal` set; nothing is sent again by itself. Webui clears it.
     private func submitGoalFromSlashCommand(_ args: String) async -> SlashCommandExecutionResult {
@@ -3586,6 +3805,10 @@ final class ChatViewModel {
         let requestedModel = args.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requestedModel.isEmpty else {
             return .unsupported(friendlyMessage: String(localized: "Usage: /model <id>"))
+        }
+
+        if let hermesSettings {
+            return await switchHermesModelFromSlashCommand(requestedModel, settings: hermesSettings)
         }
 
         guard let sessionID else {
@@ -3623,6 +3846,22 @@ final class ChatViewModel {
             composerConfigurationErrorMessage = error.localizedDescription
             return .unsupported(friendlyMessage: error.localizedDescription)
         }
+    }
+
+    /// `/model` in a Hermes session (#1015): the name resolves against `model.options` and
+    /// goes through the chip's pick, its expensive-model confirm included. A name the
+    /// catalog lacks is refused here rather than sent to the host as a guess.
+    private func switchHermesModelFromSlashCommand(_ requestedModel: String,
+                                                   settings: HermesChatSettings) async -> SlashCommandExecutionResult {
+        guard let option = settings.model(matching: requestedModel) else {
+            return .unsupported(friendlyMessage: String(localized: "This host doesn't offer a model named \(requestedModel)."))
+        }
+        guard !option.matchesSelection(modelID: selectedModelID, providerID: selectedModelProviderID) else {
+            return .executed(message: nil)
+        }
+        if await settings.select(option) || settings.controls.confirmation != nil { return .executed(message: nil) }
+        return .unsupported(friendlyMessage: settings.controls.errorMessage
+                            ?? String(localized: "Wait for this chat to connect before changing models."))
     }
 
     private func switchWorkspaceFromSlashCommand(_ args: String) async -> SlashCommandExecutionResult {
@@ -3669,6 +3908,9 @@ final class ChatViewModel {
 
     private func switchReasoningFromSlashCommand(_ args: String) async -> SlashCommandExecutionResult {
         let reasoning = args.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let hermesSettings {
+            return await switchHermesReasoningFromSlashCommand(reasoning, settings: hermesSettings)
+        }
         guard !reasoning.isEmpty else {
             return .unsupported(friendlyMessage: String(localized: "Usage: /reasoning show|hide|none|minimal|low|medium|high|xhigh"))
         }
@@ -3741,6 +3983,9 @@ final class ChatViewModel {
 
     private func setPersonalityFromSlashCommand(_ args: String) async -> SlashCommandExecutionResult {
         let requestedPersonality = args.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let hermesSettings {
+            return await askHermesPersonalityFromSlashCommand(requestedPersonality, settings: hermesSettings)
+        }
         guard !requestedPersonality.isEmpty else {
             return await personalityListMessage()
         }
@@ -3779,22 +4024,99 @@ final class ChatViewModel {
     private func personalityListMessage() async -> SlashCommandExecutionResult {
         do {
             let personalities = (try await client.personalities()).personalities ?? []
-            guard !personalities.isEmpty else {
-                return .executed(message: String(localized: "No personalities are configured on the server."))
-            }
-
-            let list = personalities.compactMap { personality -> String? in
+            return Self.personalityListMessage(personalities.compactMap { personality in
                 guard let name = personality.name, !name.isEmpty else { return nil }
-                if let description = personality.description, !description.isEmpty {
-                    return "- **\(name)** - \(description)"
-                }
-                return "- **\(name)**"
-            }
-            .joined(separator: "\n")
-
-            return .executed(message: String(localized: "Available personalities:\n\n\(list)\n\nUse `/personality <name>` or `/personality none`."))
+                return (name, personality.description ?? "")
+            })
         } catch {
             lastError = error
+            return .unsupported(friendlyMessage: error.localizedDescription)
+        }
+    }
+
+    /// The `/personality` list a webui server or Hermes host answered, with how to pick one.
+    private static func personalityListMessage(
+        _ personalities: [(name: String, description: String)]
+    ) -> SlashCommandExecutionResult {
+        guard !personalities.isEmpty else {
+            return .executed(message: String(localized: "No personalities are configured on the server."))
+        }
+        let list = personalities.map { personality in
+            personality.description.isEmpty
+                ? "- **\(personality.name)**"
+                : "- **\(personality.name)** - \(personality.description)"
+        }
+        .joined(separator: "\n")
+        return .executed(message: String(localized: "Available personalities:\n\n\(list)\n\nUse `/personality <name>` or `/personality none`."))
+    }
+
+    /// `/reasoning` in a Hermes session (#1016): a level goes through the effort chip's pick,
+    /// for this chat only. Display words are refused before anything is sent: on the host they
+    /// rewrite the display settings every client shares.
+    private func switchHermesReasoningFromSlashCommand(
+        _ level: String,
+        settings: HermesChatSettings
+    ) async -> SlashCommandExecutionResult {
+        let ladder = settings.effortLevels
+        guard !level.isEmpty else {
+            return .unsupported(friendlyMessage: String(localized: "Usage: /reasoning \(ladder.joined(separator: "|"))"))
+        }
+        guard HermesModelCatalog.effortLevels.contains(level) else {
+            if Self.hermesReasoningDisplayArgs.contains(level) {
+                return .unsupported(friendlyMessage: String(localized: "On a Hermes host, /reasoning \(level) changes display settings for every client, so Hermex doesn't send it."))
+            }
+            return .unsupported(friendlyMessage: String(localized: "Unknown reasoning level: \(level)."))
+        }
+        guard settings.showsEffort else {
+            return .unsupported(friendlyMessage: String(localized: "This model doesn't take a reasoning level."))
+        }
+        guard ladder.contains(level) else {
+            return .unsupported(friendlyMessage: String(localized: "This model can't turn reasoning off."))
+        }
+        guard level != settings.controls.effort else { return .executed(message: nil) }
+        // As the effort menu is, while a reply runs.
+        guard activeStreamID == nil else {
+            return .unsupported(friendlyMessage: String(localized: "Wait for the current response to finish before changing reasoning."))
+        }
+        if await settings.select(effort: level) { return .executed(message: nil) }
+        return .unsupported(friendlyMessage: settings.controls.errorMessage
+                            ?? String(localized: "Wait for this chat to connect before changing reasoning."))
+    }
+
+    /// `/personality` in a Hermes session (#1016). Bare, it lists the host's personalities. A
+    /// name waits for the user to confirm it (`HermesChatSettings.pendingPersonality`), because
+    /// the host writes it to the Profile's default; `none`, `default` and `clear` clear it.
+    private func askHermesPersonalityFromSlashCommand(
+        _ requested: String,
+        settings: HermesChatSettings
+    ) async -> SlashCommandExecutionResult {
+        guard !requested.isEmpty else {
+            do {
+                return Self.personalityListMessage(try await settings.personalities())
+            } catch {
+                return .unsupported(friendlyMessage: error.localizedDescription)
+            }
+        }
+        guard activeStreamID == nil else {
+            return .unsupported(friendlyMessage: String(localized: "Wait for the current response to finish before changing personality."))
+        }
+        settings.ask(personality: Self.personalityClearArgs.contains(requested.lowercased()) ? "none" : requested)
+        return .executed(message: nil)
+    }
+
+    /// Sends the `/personality` change the user confirmed. The notice names the Profile it changed.
+    func confirmHermesPersonality(_ name: String) async -> SlashCommandExecutionResult {
+        guard let settings = hermesSettings else { return .notDelivered }
+        guard activeStreamID == nil else {
+            return .unsupported(friendlyMessage: String(localized: "Wait for the current response to finish before changing personality."))
+        }
+        let profile = selectedProfileTitle
+        do {
+            try await settings.setPersonality(name)
+            return .executed(message: name == "none"
+                             ? String(localized: "Personality cleared for **\(profile)**.")
+                             : String(localized: "Personality for **\(profile)** set to **\(name)**."))
+        } catch {
             return .unsupported(friendlyMessage: error.localizedDescription)
         }
     }
@@ -6336,6 +6658,10 @@ final class ChatViewModel {
     private static let reasoningDisplayArgs: Set<String> = ["show", "hide", "on", "off"]
     private static let reasoningEffortArgs: Set<String> = ["none", "minimal", "low", "medium", "high", "xhigh"]
     private static let personalityClearArgs: Set<String> = ["none", "default", "clear"]
+    /// The host's `/reasoning` display words, which write its global display settings (#1016).
+    private static let hermesReasoningDisplayArgs: Set<String> = [
+        "show", "hide", "on", "off", "full", "all", "clamp", "collapse", "short"
+    ]
 
     private static func btwMessageText(question: String, answer: String?, isLoading: Bool) -> String {
         let trimmedAnswer = answer?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

@@ -60,7 +60,8 @@ struct HermesChatTranscript: Equatable {
 /// by text. Each prompt, steer, redirect and stop is one `write`, never resent; a Send or
 /// Queue uploads its staged files first (#1012). The host's requests (approvals,
 /// questions, sudo and secret prompts) are `requests` (#1011); the goal, `/btw` and
-/// `/background` are `sideTasks` (#1013).
+/// `/background` are `sideTasks` (#1013); its model and Profile chips are `settings` (#1015);
+/// its host's slash commands are `slashCommands` (#1036).
 ///
 /// A turn's identity is the stored key and the host's `turn_started_at`, in place of a
 /// webui stream id. A turn starts at `message.start`, an accepted send or a running
@@ -85,6 +86,10 @@ struct HermesChatTranscript: Equatable {
     let requests: HermesChatRequests
     /// The session's goal, `/btw` question and `/background` tasks (#1013).
     let sideTasks: HermesChatSideTasks
+    /// The composer's model and Profile chips (#1015).
+    let settings: HermesChatSettings
+    /// The host's slash commands, for the composer's panel and send path (#1036).
+    let slashCommands: HermesSlashCommands
 
     /// The host's `turn_started_at` for the running turn, once known.
     @ObservationIgnored private var turnStartedAt: Double?
@@ -135,12 +140,15 @@ struct HermesChatTranscript: Equatable {
         self.isNetworkAvailable = isNetworkAvailable
         requests = HermesChatRequests(engine: engine)
         sideTasks = HermesChatSideTasks(engine: engine)
+        settings = HermesChatSettings(engine: engine)
+        slashCommands = HermesSlashCommands(engine: engine)
         draftKey = engine.target.draftKey(server: engine.server, connectionID: engine.connection.id)
         engine.owner = self
         requests.onOpenChange = { [weak self] in self?.syncLiveActivityWaiting() }
         requests.onFailure = { [weak self] in self?.delegate?.hermesRequestDidFail($0) }
         requests.onNeedsReattach = { [weak self] in self?.reattach() }
         sideTasks.onNeedsReattach = { [weak self] in self?.reattach() }
+        slashCommands.onNeedsReattach = { [weak self] in self?.reattach() }
         sideTasks.onBackgroundChange = { [weak self] in self?.delegate?.hermesBackgroundDidChange($0) }
         sideTasks.onGoalChange = { [weak self] in self?.delegate?.hermesGoalDidChange($0) }
     }
@@ -321,6 +329,28 @@ struct HermesChatTranscript: Equatable {
     /// Stops a send's uploads: its prompt is not submitted, and the draft keeps its files.
     func cancelAttachmentUpload() { attachmentUpload?.cancel() }
 
+    /// A sent file's bytes from the host, by the path its chip keeps (#1030), for the chip's
+    /// thumbnail and preview. Downloads through this attach as Bot Chat does
+    /// (`HermesREST.downloadArtifact` with the session's Profile and stored key), so the
+    /// host resolves a relative `@file:` path against the session. Throws `.stale` while
+    /// detached, and for a result that lands after a reattach or a cancel.
+    func attachmentData(path: String) async throws -> Data {
+        guard engine.connectionState == .connected, let key = engine.storedKey else { throw BotFailure.stale }
+        let attempt = engine.generation
+        let context = BotArtifactContext(connectionID: engine.connection.id, profile: engine.target.profile,
+                                         sessionID: key, generation: attempt)
+        let data = try await engine.wire.artifactData(path: path, context: context)
+        try engine.check(attempt)
+        return data
+    }
+
+    /// Keys this session's thumbnails in the process-wide `TranscriptImageCache`: its
+    /// connection, Profile and stored key, so no other connection, Profile or session
+    /// ever shows them.
+    var attachmentCacheNamespace: String {
+        "hermes|\(engine.connection.id.uuidString)|\(engine.target.profile)|\(engine.storedKey ?? "")"
+    }
+
     /// A prompt's answer was lost or unreadable: reattach and rebuild, so the snapshot shows
     /// whether it ran (#508). Nothing is resent. A chat already left attaches when it reopens.
     func recoverAfterLostAnswer() {
@@ -500,6 +530,7 @@ struct HermesChatTranscript: Equatable {
     private func applyInfo(_ info: BotJSON) {
         if let model = info["model"].text, !model.isEmpty { delegate?.hermesApplyModel(model) }
         requests.applyBypass(info)
+        settings.apply(info: info, idle: info["running"].flag.map { !$0 } ?? !hostRunning)
         guard let running = info["running"].flag else { return }
         hostRunning = running
         if running {
@@ -704,17 +735,19 @@ struct HermesChatTranscript: Equatable {
 
     /// A user row as a Hermes session's transcript shows it (#1012): the reference lines a
     /// Hermex send appends become chips and the host's context footer goes
-    /// (`MessageAttachment.hermesReferences`), so no host path is shown. Every other row
-    /// is returned as it is. Bot Chat does not apply it.
+    /// (`MessageAttachment.hermesReferences`), so the text shows no host path. Each chip
+    /// keeps the path it names for `attachmentData` (#1030); chips show only their name.
+    /// Every other row is returned as it is. Bot Chat reads the rule itself.
     static func displayed(_ message: ChatMessage) -> ChatMessage {
         guard message.role == "user", let content = message.content else { return message }
         let shown = MessageAttachment.hermesReferences(in: content)
         guard shown.text != content || !shown.attachments.isEmpty else { return message }
+        let chips = shown.attachments
         return ChatMessage(
             role: message.role, content: shown.text, timestamp: message.timestamp, messageId: message.messageId,
             name: message.name, toolCallId: message.toolCallId, toolUseId: message.toolUseId,
             toolCalls: message.toolCalls, contentParts: message.contentParts, reasoning: message.reasoning,
-            attachments: shown.attachments.isEmpty ? message.attachments : (message.attachments ?? []) + shown.attachments,
+            attachments: chips.isEmpty ? message.attachments : (message.attachments ?? []) + chips,
             displayKind: message.displayKind, displayMetadata: message.displayMetadata, turnTps: message.turnTps,
             turnDuration: message.turnDuration, rowID: message.rowID
         )
@@ -811,6 +844,7 @@ extension HermesChatTurnCoordinator: ChatTurnCoordinating {
 extension HermesChatTurnCoordinator: HermesConversationOwner {
     func conversationDidReset() {
         requests.reset()
+        settings.disconnect()
         heldFrames = []; deltasInRebuild = []; replayedReply = ""
     }
 
@@ -843,6 +877,9 @@ extension HermesChatTurnCoordinator: HermesConversationOwner {
         refusedSignIn = false
         delegate?.hermesConnectionDidChange(failure: nil)
         sideTasks.didConnect(runtime: runtime, attempt: attempt)
+        // Off the attach's path: the chips and the `/` panel fill in once their catalogs answer.
+        Task { [settings] in await settings.connect(runtime: runtime, attempt: attempt) }
+        Task { [slashCommands] in await slashCommands.connect(runtime: runtime, attempt: attempt) }
     }
 
     func conversation(didReceive frame: BotJSON, afterGap: Bool) {
