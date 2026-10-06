@@ -86,12 +86,6 @@ struct TranscriptMediaReference: Equatable, Identifiable {
         return .unsupported
     }
 
-    /// Shares document support with workspace files and attachments, without
-    /// replacing the transcript's dedicated image, audio and video surfaces.
-    var binaryPreview: BinaryFilePreview? {
-        mediaKind == .unsupported ? BinaryFilePreview(path: displayName) : nil
-    }
-
     var isRasterImageCandidate: Bool {
         mediaKind == .image
     }
