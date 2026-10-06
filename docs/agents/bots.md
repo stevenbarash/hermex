@@ -836,6 +836,9 @@ Their cards need no webui byte loader. Local paths use the attach-scoped artifac
 transport; image thumbnails, image lightboxes and video players also use that
 transport without changing their presentation. Unsupported files keep the
 download-only row. Webui Sessions' media rendering and transport are unchanged.
+Native document cards follow the interface's layout direction, including their
+forward chevron. Image, audio, video and webui media keep the existing LTR anchor
+inside RTL messages.
 
 Remote document URLs are fetched as URLs, never passed to `/api/fs/download`.
 They use a public ephemeral session with no cookies, stored HTTP credentials,
