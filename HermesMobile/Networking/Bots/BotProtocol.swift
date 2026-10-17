@@ -45,9 +45,16 @@ enum BotFailure: Error, Equatable, LocalizedError {
     /// (an access proxy's login page), or `/api/status` answered a 401 whose body is not a
     /// JSON object. Permanent.
     case blocked
-    /// The host requires sign-in but offers no `basic` provider, only a browser (OIDC)
-    /// one Hermex can't use yet. Permanent.
+    /// The host requires sign-in but offers neither a `basic` provider nor browser sign-in
+    /// (`auth_flows ∋ native_pkce`), or a form that can't sign in through the browser met
+    /// one that offers only that, such as Move to Hermes's destination. Permanent.
     case browserSignIn
+    /// The host no longer accepts a browser sign-in's refresh token (#708): 401
+    /// `session_expired` from `/auth/native/refresh`. The user has to sign in again. Permanent.
+    case signInExpired
+    /// A browser sign-in that closed without a code, or whose code the host no longer
+    /// accepts (it lasts 120 seconds and works once). Trying again starts a new one.
+    case browserSignInFailed
     /// The gateway upgrade was refused with this HTTP status after a good sign-in, usually
     /// by a proxy that drops the ticket header or has no WebSocket support. Permanent;
     /// 408, 429 and 5xx arrive as `.rejected` instead (`init(upgradeStatus:)`).
@@ -76,6 +83,8 @@ enum BotFailure: Error, Equatable, LocalizedError {
         case .invalidAddress: return String(localized: "Enter a Hermes HTTP or HTTPS address without a path, credentials or query.")
         case .blocked: return String(localized: "Something in front of Hermes, such as Cloudflare Access, wants its own sign-in first. Add its service token under Connection Headers in the Hermes connection, or use an address that skips it, such as the dashboard's local network address.")
         case .browserSignIn: return String(localized: "This Hermes host only offers sign-in with a browser, which Hermex doesn't support yet. To connect now, add a dashboard username and password on the host.")
+        case .signInExpired: return String(localized: "Your Hermes sign-in expired. Sign in again.")
+        case .browserSignInFailed: return String(localized: "The browser sign-in didn't finish. Try again.")
         case .upgradeRefused: return String(localized: "Hermes accepted the sign-in, but the live connection was refused. If a proxy or tunnel sits in front of Hermes, turn on WebSocket support and let the Sec-WebSocket-Protocol header through.")
         case .outdated(let version):
             return String(localized: "This Hermes host runs \(version). Hermex needs Hermes \(HermesCompatibility.minimumVersion) or later. Update Hermes on the host, then try again.")
@@ -89,6 +98,24 @@ enum BotFailure: Error, Equatable, LocalizedError {
 /// `URLError`s pass through `BotClient` unwrapped on purpose: reconnect logic reads any
 /// non-`BotFailure` error as transport, so only the copy maps them.
 enum BotConnectionAdvice {
+    /// Whether a screen that lost its connection to `error` should reconnect on its backoff
+    /// (the inbox, the Sessions list). False for a refusal the user has to act on: sign-in,
+    /// an unsupported host or address, an address that now reaches a different host or is not
+    /// a dashboard, an access proxy's own sign-in, a host with browser sign-in only, an expired
+    /// browser sign-in, a refused gateway upgrade, a Hermes release older than the minimum, and
+    /// any other permanent HTTP client error (a 404 is not a Hermes host). Server errors, rate limits and JSON-RPC
+    /// faults other than "method missing" are the retry loop's problem.
+    static func isRetryable(_ error: Error) -> Bool {
+        switch error as? BotFailure {
+        case .unsupported, .wrongIdentity, .differentHost, .invalidAddress, .notDashboard,
+             .blocked, .browserSignIn, .signInExpired, .upgradeRefused, .outdated: return false
+        case .rejected(-32601), .rejected(4090), .rejected(4130): return false
+        case .rejected(408), .rejected(429): return true
+        case .rejected(let code): return !(400..<500).contains(code)
+        default: return true
+        }
+    }
+
     static func message(for error: Error, address: URL) -> String {
         let host = address.host ?? address.absoluteString
         if let error = error as? URLError {
@@ -146,16 +173,52 @@ enum BotConnectionAdvice {
     /// socket write, so an action that went stale while queued is never sent.
     func call(_ call: HermesCall, validateDispatch: (() throws -> Void)?) async throws -> BotJSON
     func uploadImage(data: Data, filename: String, context: BotArtifactContext) async throws -> String
-    func artifactData(path: String, context: BotArtifactContext) async throws -> Data
+    /// One file the host serves by `path` under `context`'s Profile and session. `limit` caps a
+    /// preview's bytes; nil reads the whole file, as a MEDIA file's export does (#1112).
+    func artifactData(path: String, context: BotArtifactContext, limit: Int?) async throws -> Data
+    /// Makes sure the agents of `profile`'s sessions are told what Hermex shows
+    /// (`HermesConnection.keepPlatformNote`). Never throws: a chat opens without the note.
+    func keepPlatformNote(profile: String) async
     /// Removes a Profile on the host over the authenticated HTTP session. Only
     /// a 200 with `ok` counts as deleted; anything else leaves the bot in place.
     func deleteProfile(_ name: String) async throws
     /// The Profile the host's dashboard is scoped to (`/api/profiles/active` `current`), the
     /// one a new session runs under.
     func currentProfile() async throws -> String
-    /// A stored session's latest rows under `profile` (`HermesREST.sessionMessages`), or nil
-    /// when the host has no such session (404).
-    func sessionMessages(_ key: String, profile: String) async throws -> [BotJSON]?
+    /// A stored session's rows under `profile` (`HermesREST.sessionMessages`): its latest 500
+    /// without an offset, else one transcript page from `offset` (#1047). Nil when the host has
+    /// no such session (404).
+    func sessionMessages(_ key: String, profile: String, offset: Int?) async throws -> [BotJSON]?
+    /// `text` spoken in `profile`'s voice (`HermesREST.speak`): the audio bytes, of a format the
+    /// host's TTS provider chose. Any refusal or unreadable reply throws.
+    func speech(text: String, profile: String) async throws -> Data
+    /// One page of `profile`'s sessions for the Sessions list, or with `archived` for the
+    /// Archived screen (`HermesREST.sessionList`, #1046, #1048).
+    func sessionPage(profile: String, offset: Int, archived: Bool) async throws -> HermesSessionPage
+    /// One page of every session `profile` lists, for Move to Hermes's scan
+    /// (`HermesREST.sessionScan`, #1213).
+    func sessionScanPage(profile: String, offset: Int) async throws -> HermesScanPage
+    /// Writes one change to a session (`HermesREST.updateSession`, #1046, #1048) and returns the
+    /// title the host keeps. A change the host refuses with its reason, such as a title already
+    /// in use, throws `HermesSessionRefusal`.
+    @discardableResult
+    func updateSession(_ change: HermesSessionChange, key: String, profile: String) async throws -> String?
+    /// The session's row and messages as the host exports them (`HermesREST.sessionExport`, #1048).
+    func exportSession(key: String, profile: String) async throws -> Data
+    /// That exact session's stored row (`HermesREST.sessionRow`, #1051); nil when the host has
+    /// no such session (404).
+    func sessionRow(key: String, profile: String) async throws -> BotJSON?
+    /// Sends one session import, its JSON `body` already encoded (`HermesREST.importSessions`,
+    /// #1051), and returns the host's result. A payload the host refuses throws its reason as
+    /// `HermesSessionRefusal`, with every session it named in `entries` (#1213).
+    func importSessions(body: Data) async throws -> BotJSON
+    /// `profile`'s sessions matching `query`, in the host's order, at most `limit`
+    /// (`HermesREST.sessionSearch`, #1053).
+    func searchSessions(query: String, profile: String, limit: Int) async throws -> [HermesSessionSearchResult]
+    /// The runtimes this phone's screens attached on the connection (`session.resume`) or branched
+    /// (`session.branch`, #1051) and have not closed, so a delete can tell its own from another
+    /// app's (#1048).
+    var attachedRuntimes: Set<String> { get }
     /// Ends this screen's calls, uploads and downloads; the shared socket stays for others.
     func close()
 }
@@ -169,8 +232,15 @@ extension BotTransport {
         throw BotFailure.unsupported
     }
 
-    func artifactData(path: String, context: BotArtifactContext) async throws -> Data {
+    func artifactData(path: String, context: BotArtifactContext, limit: Int?) async throws -> Data {
         throw BotArtifactFailure.unavailable
+    }
+
+    func keepPlatformNote(profile: String) async {}
+
+    /// A preview's download: at most 25 MB.
+    func artifactData(path: String, context: BotArtifactContext) async throws -> Data {
+        try await artifactData(path: path, context: context, limit: BotArtifactBuffer.maximumBytes)
     }
 
     func deleteProfile(_ name: String) async throws {
@@ -181,9 +251,53 @@ extension BotTransport {
         throw BotFailure.unsupported
     }
 
-    func sessionMessages(_ key: String, profile: String) async throws -> [BotJSON]? {
+    func sessionMessages(_ key: String, profile: String, offset: Int?) async throws -> [BotJSON]? {
         throw BotFailure.unsupported
     }
+
+    func speech(text: String, profile: String) async throws -> Data {
+        throw BotFailure.unsupported
+    }
+
+    /// A stored session's latest 500 rows, as a background task's result reads them.
+    func sessionMessages(_ key: String, profile: String) async throws -> [BotJSON]? {
+        try await sessionMessages(key, profile: profile, offset: nil)
+    }
+
+    func sessionPage(profile: String, offset: Int, archived: Bool) async throws -> HermesSessionPage {
+        throw BotFailure.unsupported
+    }
+
+    func sessionScanPage(profile: String, offset: Int) async throws -> HermesScanPage {
+        throw BotFailure.unsupported
+    }
+
+    func updateSession(_ change: HermesSessionChange, key: String, profile: String) async throws -> String? {
+        throw BotFailure.unsupported
+    }
+
+    func exportSession(key: String, profile: String) async throws -> Data {
+        throw BotFailure.unsupported
+    }
+
+    func sessionRow(key: String, profile: String) async throws -> BotJSON? {
+        throw BotFailure.unsupported
+    }
+
+    func importSessions(body: Data) async throws -> BotJSON {
+        throw BotFailure.unsupported
+    }
+
+    func searchSessions(query: String, profile: String, limit: Int) async throws -> [HermesSessionSearchResult] {
+        throw BotFailure.unsupported
+    }
+
+    /// The search at the Sessions list's page size, `HermesREST.sessionSearchLimit`.
+    func searchSessions(query: String, profile: String) async throws -> [HermesSessionSearchResult] {
+        try await searchSessions(query: query, profile: profile, limit: HermesREST.sessionSearchLimit)
+    }
+
+    var attachedRuntimes: Set<String> { [] }
 
     func call(_ call: HermesCall) async throws -> BotJSON {
         try await self.call(call, validateDispatch: nil)
@@ -205,6 +319,11 @@ struct BotHostStatus: Equatable {
     var heartbeatStale: Double?
     var platformsConnected: Int?
     var platformsConfigured: Int?
+    /// Every Profile's name, which the host reports even behind its sign-in (#1180); nil when
+    /// it reports none.
+    var profiles: [String]?
+    /// Whether the host asks for browser sign-in (`HermesBrowserSignIn.isRequired(by:)`).
+    var signsInWithBrowser: Bool
 
     init(_ json: BotJSON) {
         version = json["version"].text
@@ -214,6 +333,12 @@ struct BotHostStatus: Equatable {
         heartbeatStale = json["gateway_heartbeat_stale_s"].number
         platformsConnected = json["components"]["platforms"]["connected"].integer
         platformsConfigured = json["components"]["platforms"]["configured"].integer
+        profiles = json["profiles"].list.map { items in
+            var seen = Set<String>()
+            return items.compactMap { $0.text?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty && seen.insert($0).inserted }
+        }
+        signsInWithBrowser = HermesBrowserSignIn.isRequired(by: json)
     }
 }
 
@@ -261,6 +386,37 @@ struct BotHostStatusProbe {
             return .success(BotHostStatus(json))
         } catch {
             return .failure(.unreachable(error.localizedDescription))
+        }
+    }
+}
+
+extension BotJSON {
+    /// Tool arguments in the shared transcript model's JSON type.
+    var argumentDictionary: [String: JSONValue]? {
+        guard case .object(let object) = self, !object.isEmpty else { return nil }
+        return object.mapValues(\.jsonValue)
+    }
+
+    var jsonValue: JSONValue {
+        switch self {
+        case .object(let value): return .object(value.mapValues(\.jsonValue))
+        case .array(let value): return .array(value.map(\.jsonValue))
+        case .string(let value): return .string(value)
+        case .number(let value): return .number(value)
+        case .bool(let value): return .bool(value)
+        case .null: return .null
+        }
+    }
+
+    /// A tool result as the text the shared tool row formatter parses: a string as
+    /// is, any other JSON re-encoded so envelope fields such as `error` are read.
+    var toolResultPreview: String? {
+        switch self {
+        case .null: return nil
+        case .string(let text): return text.isEmpty ? nil : text
+        default:
+            guard let data = try? JSONEncoder().encode(self) else { return nil }
+            return String(decoding: data, as: UTF8.self)
         }
     }
 }

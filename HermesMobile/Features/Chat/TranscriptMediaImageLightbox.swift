@@ -22,19 +22,17 @@ struct TranscriptMediaImageLightbox: View {
 
     init(
         server: URL,
-        sessionID: String?,
+        files: (any WorkspaceFileClient)?,
         item: TranscriptMediaPreviewItem,
-        onAPIError: @escaping (Error) -> Void,
-        download: (() async throws -> Data)? = nil
+        onAPIError: @escaping (Error) -> Void
     ) {
         self.item = item
         self.onAPIError = onAPIError
         _viewModel = State(
             initialValue: TranscriptMediaPreviewViewModel(
                 server: server,
-                sessionID: sessionID,
-                reference: item.reference,
-                download: download
+                files: files,
+                reference: item.reference
             )
         )
     }

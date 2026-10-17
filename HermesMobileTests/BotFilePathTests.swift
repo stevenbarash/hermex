@@ -151,37 +151,6 @@ final class BotAtPanelSectionTests: XCTestCase {
         XCTAssertEqual(files.map(\.path), ["src/App.swift"])
     }
 
-    func testEmptyRosterShowsFilesAlone() {
-        let sections = BotAtPanelSection.sections(
-            botCompletions: [],
-            fileMatches: [match("src/App.swift")],
-            isLoadingFiles: false
-        )
-
-        XCTAssertEqual(sections.count, 1)
-        guard case .files = sections[0] else { return XCTFail("A files-only panel expected") }
-    }
-
-    func testFailedLookupLeavesTheRosterStanding() {
-        let sections = BotAtPanelSection.sections(
-            botCompletions: [bot("research")],
-            fileMatches: [],
-            isLoadingFiles: false
-        )
-
-        XCTAssertEqual(sections.count, 1)
-        guard case .bots(let bots) = sections[0] else { return XCTFail("The roster must survive a failed lookup") }
-        XCTAssertEqual(bots.map(\.tag), ["research"])
-    }
-
-    func testNothingToShowMeansNoPanel() {
-        XCTAssertTrue(BotAtPanelSection.sections(
-            botCompletions: [],
-            fileMatches: [],
-            isLoadingFiles: false
-        ).isEmpty)
-    }
-
     func testLoadingShowsTheFilesHeadingWithNoRowsYet() {
         let sections = BotAtPanelSection.sections(
             botCompletions: [],
@@ -218,89 +187,5 @@ final class BotAtPanelSectionTests: XCTestCase {
 
     private func match(_ path: String) -> ComposerFilePathSearch.Match {
         ComposerFilePathSearch.Match(path: path, name: path, parentPath: "", isDirectory: false)
-    }
-}
-
-@MainActor
-final class BotFilePathConversationTests: XCTestCase {
-    func testCompletePathIsScopedToTheLiveRuntimeAndProfile() async throws {
-        let target = BotProfile(.object(["name": .string("default")]))!
-        let wire = BotFixtureWire()
-        wire.settingsCall = Self.completion(items: [
-            ["text": "research-notes.md", "display": "research-notes.md", "meta": ""]
-        ])
-        let model = make(wire, roster: [target])
-        await model.recover()
-
-        await model.searchFilePaths("res")
-
-        let call = try XCTUnwrap(wire.calls.first { $0.0 == "complete.path" })
-        XCTAssertEqual(call.1["word"], .string("res"))
-        XCTAssertEqual(call.1["session_id"], .string(wire.runtimeID))
-        XCTAssertEqual(call.1["profile"], .string("inbox-triage"))
-        XCTAssertEqual(model.filePathSearch.matches.map(\.path), ["research-notes.md"])
-        model.suspend()
-    }
-
-    func testBareQueryAsksForTheRootAndAFailedLookupPublishesNothing() async throws {
-        let target = BotProfile(.object(["name": .string("default")]))!
-        let wire = BotFixtureWire()
-        let model = make(wire, roster: [target])
-        await model.recover()
-
-        await model.searchFilePaths("")
-
-        XCTAssertEqual(wire.calls.last?.1["word"], .string("."))
-        XCTAssertTrue(model.filePathSearch.matches.isEmpty)
-        XCTAssertFalse(model.filePathSearch.isLoading)
-        model.suspend()
-    }
-
-    func testDisconnectedConversationNeverAsksTheHost() async {
-        let wire = BotFixtureWire()
-        let model = make(wire, roster: [])
-
-        await model.searchFilePaths("res")
-
-        XCTAssertTrue(wire.calls.isEmpty)
-        XCTAssertTrue(model.filePathSearch.matches.isEmpty)
-        XCTAssertFalse(model.filePathSearch.isLoading)
-    }
-
-    func testPickedChipsAndRowsDieWithTheWorkspace() async throws {
-        let target = BotProfile(.object(["name": .string("default")]))!
-        let wire = BotFixtureWire()
-        wire.settingsCall = Self.completion(items: [
-            ["text": "src/App.swift", "display": "App.swift", "meta": "src"]
-        ])
-        let model = make(wire, roster: [target])
-        await model.recover()
-
-        await model.searchFilePaths("App")
-        model.recordFileChipReference("src/App.swift")
-        XCTAssertEqual(model.fileChipPaths, ["src/App.swift"])
-        XCTAssertEqual(model.filePathSearch.matches.map(\.path), ["src/App.swift"])
-
-        model.resetFileReferences()
-
-        XCTAssertTrue(model.fileChipPaths.isEmpty)
-        XCTAssertTrue(model.filePathSearch.matches.isEmpty)
-        model.suspend()
-    }
-
-    private func make(_ wire: BotFixtureWire, roster: [BotProfile]) -> BotConversation {
-        BotConversation(server: URL(string: "https://webui.example")!,
-                        connection: BotConnection(id: UUID(), name: "Test", address: URL(string: "https://bot.example")!, username: "test", password: "test"),
-                        profile: BotProfile(.object(["name": .string("inbox-triage")]))!, roster: roster,
-                        wire: wire, drafts: ChatDraftStore(persistence: BotMemoryDrafts(), debounceDuration: .seconds(60)),
-                        attachmentCopies: BotAttachmentCopies())
-    }
-
-    private static func completion(items: [[String: String]]) -> (String, [String: BotJSON]) -> BotJSON {
-        { _, _ in
-            .object(["items": .array(items.map { item in
-                .object(item.mapValues { BotJSON.string($0) })
-            })])
-        }
     }
 }

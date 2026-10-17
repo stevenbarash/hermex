@@ -22,7 +22,7 @@ extension EnvironmentValues {
         set { self[ChatWorkspaceRootKey.self] = newValue }
     }
 
-    /// Hermes Sessions opt into document previews without changing the webui
+    /// Hermes sessions opt into document previews without changing the webui
     /// transcript's download-only file rows.
     var previewsHermesDocuments: Bool {
         get { self[HermesDocumentPreviewKey.self] }
@@ -84,6 +84,9 @@ struct TranscriptMediaContentView: View {
                     if previewsHermesDocuments && reference.isHermesDocumentCandidate && onPreviewMedia != nil {
                         thumbnail
                     } else {
+                        // Pin the image container LTR so media keeps its leading-edge
+                        // anchor inside an RTL message (#259); the text segments above
+                        // still follow the chat direction.
                         thumbnail.forcedLeftToRight()
                     }
                 }
@@ -164,7 +167,10 @@ private struct TranscriptMediaThumbnailView: View {
 
         case .unsupported where previewsHermesDocuments && reference.isHermesDocumentCandidate && onPreviewMedia != nil:
             if let onPreviewMedia {
-                TranscriptMediaDocumentCard(reference: reference) { onPreviewMedia(reference) }
+                TranscriptMediaDocumentCard(
+                    reference: reference,
+                    loadMediaData: loadMediaData.map { load in { await load(reference) } }
+                ) { onPreviewMedia(reference) }
             }
 
         case .unsupported where loadMediaData != nil:
@@ -420,45 +426,125 @@ private struct TranscriptMediaAudioExportView: View {
     }
 }
 
-/// A document preview needs only its reference and tap action, not a legacy
-/// inline byte loader. The existing BotArtifactPreview owns loading and export.
+/// A Hermes MEDIA document: tapping the card body opens the capped native
+/// preview (`BotArtifactPreview`); the separate download button exports the
+/// whole file through `loadMediaData` (the uncapped MEDIA export, as on
+/// master) without starting or waiting for a preview download, so a document
+/// over the preview cap still saves and shares.
 private struct TranscriptMediaDocumentCard: View {
     let reference: TranscriptMediaReference
+    let loadMediaData: (() async -> Data?)?
     let onPreview: () -> Void
 
+    @State private var exportDocument = ExportedFileDocument(data: Data())
+    @State private var exportContentType = UTType.data
+    @State private var exportFilename = String(localized: "Hermes Media")
+    @State private var isFileExporterPresented = false
+    @State private var isExporting = false
+    @State private var errorMessage: String?
+
     var body: some View {
-        Button(action: onPreview) {
-            HStack(spacing: 8) {
-                Image(systemName: "doc")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(Color(.secondaryLabel))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(reference.displayName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color(.label))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text("Tap to preview")
-                        .font(.caption2)
+        HStack(spacing: 8) {
+            Button(action: onPreview) {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc")
+                        .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(Color(.secondaryLabel))
-                        .lineLimit(1)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(reference.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color(.label))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(isExporting
+                             ? String(localized: "Loading…")
+                             : String(localized: "Tap to preview"))
+                            .font(.caption2)
+                            .foregroundStyle(Color(.secondaryLabel))
+                            .lineLimit(1)
+                    }
                 }
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.forward")
-                    .font(.system(size: 15, weight: .semibold))
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .frame(maxWidth: 240, minHeight: 44, alignment: .leading)
-            .background(Color(.secondarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(Color(.separator).opacity(0.35), lineWidth: 0.5)
-            )
+            .buttonStyle(.chatTactile(.thumbnail))
+            .accessibilityLabel(String(localized: "Preview \(reference.displayName)"))
+
+            Spacer(minLength: 8)
+
+            if loadMediaData != nil {
+                Button {
+                    Task { await exportFile() }
+                } label: {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .buttonStyle(.chatTactile(.icon))
+                .disabled(isExporting)
+                .accessibilityLabel(String(localized: "Download \(reference.displayName)"))
+            }
+
+            Image(systemName: "chevron.forward")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color(.secondaryLabel))
         }
-        .buttonStyle(.chatTactile(.thumbnail))
-        .accessibilityLabel(String(localized: "Preview \(reference.displayName)"))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 240, minHeight: 44, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color(.separator).opacity(0.35), lineWidth: 0.5)
+        )
+        .accessibilityElement(children: .contain)
+        .fileExporter(
+            isPresented: $isFileExporterPresented,
+            document: exportDocument,
+            contentType: exportContentType,
+            defaultFilename: exportFilename
+        ) { result in
+            if case let .failure(error) = result {
+                errorMessage = error.localizedDescription
+            }
+        }
+        .alert(
+            "Download Failed",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        errorMessage = nil
+                    }
+                }
+            )
+        ) {
+            Button("OK") {
+                errorMessage = nil
+            }
+        } message: {
+            Text(errorMessage ?? "")
+        }
+    }
+
+    private func exportFile() async {
+        guard let loadMediaData else { return }
+        isExporting = true
+        defer {
+            isExporting = false
+        }
+
+        guard let data = await loadMediaData(), !Task.isCancelled else {
+            if !Task.isCancelled {
+                errorMessage = String(localized: "Could not load file.")
+            }
+            return
+        }
+
+        let payload = TranscriptMediaExportSupport.payload(for: reference, data: data, resolvedKind: .data)
+        exportDocument = ExportedFileDocument(data: payload.data)
+        exportContentType = payload.contentType
+        exportFilename = payload.filename
+        isFileExporterPresented = true
     }
 }
 
@@ -704,19 +790,17 @@ struct TranscriptMediaPreviewView: View {
 
     init(
         server: URL,
-        sessionID: String?,
+        files: (any WorkspaceFileClient)?,
         item: TranscriptMediaPreviewItem,
-        onAPIError: @escaping (Error) -> Void,
-        download: (() async throws -> Data)? = nil
+        onAPIError: @escaping (Error) -> Void
     ) {
         self.item = item
         self.onAPIError = onAPIError
         _viewModel = State(
             initialValue: TranscriptMediaPreviewViewModel(
                 server: server,
-                sessionID: sessionID,
-                reference: item.reference,
-                download: download
+                files: files,
+                reference: item.reference
             )
         )
     }

@@ -1,4 +1,5 @@
 import Observation
+import SwiftData
 import UIKit
 
 /// The Bots inbox for one configured server: the roster, Desktop's pin, hidden and
@@ -216,9 +217,14 @@ import UIKit
     private let sectionOrderStore: BotSectionOrderStore
     private let avatarStore: BotAvatarStore
     private let historyCache: BotHistoryCache
+    /// Where each roster read leaves the Profiles' names for the Shortcuts picker (#1180).
+    private let profileNames: HermesProfileNameCache
     private let makeWire: @MainActor (BotConnection) -> any BotTransport
-    /// Drops this phone's drafts and cached history for one deleted bot.
+    /// Drops this phone's drafts for one deleted bot.
     private let purgeLocalState: @MainActor (UUID, String) async -> Void
+    /// The offline cache, from the inbox's screen: a deleted bot's Bot Chat transcript leaves
+    /// it too (#1144).
+    @ObservationIgnored var offlineCache: ModelContext?
     /// Minimum gap between event-driven roster reads; the host already floors
     /// `sessions.changed` at two seconds, this guards against a chattier one.
     private let reloadSpacing: Duration
@@ -232,7 +238,8 @@ import UIKit
     init(server: URL, store: BotConnectionStore? = nil, unread: BotUnreadStore = BotUnreadStore(),
          roomStore: BotRoomOrganizeStore = BotRoomOrganizeStore(),
          sectionOrderStore: BotSectionOrderStore = BotSectionOrderStore(),
-         avatarStore: BotAvatarStore? = nil, historyCache: BotHistoryCache = .shared, reloadSpacing: Duration = .seconds(1),
+         avatarStore: BotAvatarStore? = nil, historyCache: BotHistoryCache = .shared,
+         profileNames: HermesProfileNameCache = .shared, reloadSpacing: Duration = .seconds(1),
          reconnectDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(16), .seconds(30)],
          statusPollInterval: Duration = .seconds(5),
          makeWire: (@MainActor (BotConnection) -> any BotTransport)? = nil,
@@ -240,11 +247,10 @@ import UIKit
         self.server = server; self.store = store ?? BotConnectionStore(); self.unread = unread; self.roomStore = roomStore
         self.sectionOrderStore = sectionOrderStore
         self.avatarStore = avatarStore ?? .shared; self.reloadSpacing = reloadSpacing
-        self.reconnectDelays = reconnectDelays; self.historyCache = historyCache
+        self.reconnectDelays = reconnectDelays; self.historyCache = historyCache; self.profileNames = profileNames
         self.statusPollInterval = statusPollInterval
         self.makeWire = makeWire ?? { BotClient(saved: $0, server: server) }
         self.purgeLocalState = purgeLocalState ?? { connectionID, profile in
-            try? await BotHistoryCache.shared.removeProfile(server: server, connectionID: connectionID, profileID: profile)
             await ChatDraftStore.shared.discardBotDrafts(server: server, connectionID: connectionID, profile: profile)
         }
         // Known before the first frame, so a saved connection draws the loading
@@ -259,6 +265,39 @@ import UIKit
         let shown = matching.filter { !$0.hidden }
         return Rows(pinned: shown.filter(\.pinned), others: shown.filter { !$0.pinned },
                     hidden: showsHidden || !search.isEmpty ? matching.filter(\.hidden) : [])
+    }
+
+    /// A bot whose Bot Chat matched a message search on the host (#1146).
+    struct BotChatHit: Identifiable, Equatable {
+        let profileID: String
+        /// The host's FTS snippet, with `>>>` and `<<<` around each match; nil for an id match.
+        let snippet: String?
+        /// The matched message is the user's rather than the bot's; nil for an id match, which
+        /// names no message.
+        let isFromUser: Bool?
+        var id: String { profileID }
+    }
+
+    /// Searches each roster bot's Bot Chat on the host for `query` (#1146), Profile by Profile, as
+    /// the Sessions list does (`HermesREST.sessionSearch`); a Profile's other sessions, its rooms'
+    /// and a replaced Bot Chat's included, are not hits, since a hit opens the bot's current chat. The host can neither filter for the Bot Chat nor page, so each
+    /// search asks for its maximum; a Bot Chat behind that many other matches is not found. Empty
+    /// while the inbox is not live. A reply that lands after the inbox closed or reconnected
+    /// throws `BotFailure.stale`.
+    func searchBotChats(_ query: String) async throws -> [BotChatHit] {
+        guard link == .live, let client = wire, !query.isEmpty else { return [] }
+        var hits: [BotChatHit] = []
+        for profile in profiles {
+            let results = try await client.searchSessions(query: query, profile: profile.id,
+                                                          limit: HermesREST.sessionSearchMaximum)
+            guard wire === client else { throw BotFailure.stale }
+            try Task.checkCancellation()
+            let current = Set([profile.canonicalID, profile.canonicalTipID].compactMap { $0 })
+            if let match = results.first(where: { $0.row.isBotChat && (current.contains($0.row.id) || current.contains($0.row.identity)) }) {
+                hits.append(BotChatHit(profileID: profile.id, snippet: match.snippet, isFromUser: match.role.map { $0 == "user" }))
+            }
+        }
+        return hits
     }
 
     /// True when the canonical chat moved past what this device last showed.
@@ -397,27 +436,6 @@ import UIKit
         link = .idle
     }
 
-    /// A lost socket or a failed read is retried quietly, with growing delays, for
-    /// as long as the inbox stays open; the roster stays on screen meanwhile. Only
-    /// a refusal the user has to act on shows a message and the Reconnect button
-    /// (Update sign-in for a rejected password): sign-in, an unsupported host or
-    /// address, an address that now reaches a different host or is not a dashboard,
-    /// an access proxy's own sign-in, a host with browser sign-in only, a refused
-    /// gateway upgrade, a Hermes release older than the minimum, and any other
-    /// permanent HTTP client error (a 404 is not a Hermes host). Server errors, rate limits and JSON-RPC faults other than
-    /// "method missing" are the retry loop's problem; an empty inbox shows
-    /// `routeAdvice` if the host stays unreachable.
-    private static func isRetryable(_ error: Error) -> Bool {
-        switch error as? BotFailure {
-        case .unsupported, .wrongIdentity, .differentHost, .invalidAddress, .notDashboard,
-             .blocked, .browserSignIn, .upgradeRefused, .outdated: return false
-        case .rejected(-32601), .rejected(4090), .rejected(4130): return false
-        case .rejected(408), .rejected(429): return true
-        case .rejected(let code): return !(400..<500).contains(code)
-        default: return true
-        }
-    }
-
     /// The host could not be reached at all: no answer, or a proxy or Cloudflare
     /// answering for it. Repeated, these replace an empty inbox's skeleton with advice.
     private static func isRouteFailure(_ error: Error) -> Bool {
@@ -461,20 +479,14 @@ import UIKit
         }
     }
 
-    /// The Profile a new session runs under: the one the host's dashboard is scoped to.
-    /// Throws `.stale` once the inbox's connection closed or was replaced meanwhile.
-    func currentProfile() async throws -> String {
-        guard link == .live, let client = wire else { throw BotFailure.transport }
-        let profile = try await client.currentProfile()
-        guard wire === client else { throw BotFailure.stale }
-        return profile
-    }
-
     /// Drops everything this phone kept for a bot that no longer exists on the host.
     private func forget(_ profile: String) async {
         guard let connection else { return }
         seen.removeValue(forKey: profile); persistSeen()
         avatarStore.setImage(nil, connectionID: connection.id, profile: profile, revision: nil)
+        if let offlineCache {
+            try? CacheStore.removeHermesBotChats(serverURL: server, connectionID: connection.id, profile: profile, in: offlineCache)
+        }
         await purgeLocalState(connection.id, profile)
     }
 
@@ -569,12 +581,8 @@ import UIKit
             guard let rows = roster["profiles"].list else { throw BotFailure.unsupported }
             var ids = Set<String>()
             profiles = rows.compactMap(BotProfile.init).filter { ids.insert($0.id).inserted }
-            if let connection {
-                let scope = BotHistoryCache.Scope(server: server, connectionID: connection.id)
-                historyCache.recent.remove {
-                    guard $0.scope == scope, case .bot(let id) = $0.conversation else { return false }
-                    return !ids.contains(id)
-                }
+            if profileNames.save(profiles.map { .init(profile: $0.id, title: $0.name) }, for: server) {
+                ProfileEntityProvider.refreshAppShortcuts(changed: true)
             }
             var changed = false
             for profile in profiles {
@@ -833,13 +841,18 @@ import UIKit
         }
     }
 
+    /// A lost socket or a failed read is retried quietly, with growing delays, for as long as
+    /// the inbox stays open; the roster stays on screen meanwhile. Only a refusal the user has
+    /// to act on (`BotConnectionAdvice.isRetryable`) shows a message and the Reconnect button
+    /// (Update sign-in for a rejected password). An empty inbox shows `routeAdvice` if the
+    /// host stays unreachable.
     private func drop(_ client: any BotTransport, error: Error) {
         reloadTask?.cancel(); reloadTask = nil; reloadWanted = false
         statusPollTask?.cancel(); statusPollTask = nil; setLiveStatuses([:])
         client.close(); wire = nil
         link = .disconnected
         let address = connection?.address
-        guard Self.isRetryable(error) else {
+        guard BotConnectionAdvice.isRetryable(error) else {
             routeFailures = 0; routeAdvice = nil
             errorMessage = address.map { BotConnectionAdvice.message(for: error, address: $0) }
                 ?? (error as? BotFailure ?? .transport).localizedDescription

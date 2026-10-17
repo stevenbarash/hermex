@@ -33,7 +33,7 @@ Hermex is a native SwiftUI iPhone app for driving a self-hosted [hermes-webui](h
 ## Features
 
 - **Chat with your agent** — send messages with model, reasoning-effort, workspace, and profile options; attach files and images; watch responses stream in real time with thinking and tool-call detail.
-- **Documents in direct-Hermes chats** — tap returned PDF and supported-document `MEDIA:` cards for native Quick Look, Save to Files, and Share. Host files stay scoped to their Profile/session; remote documents use credential-free URL downloads. Both stop at 25 MB.
+- **Documents in direct-Hermes chats** — tap returned PDF and supported-document `MEDIA:` cards for native Quick Look, Save to Files, and Share. Host files stay scoped to their Profile/session; remote documents use credential-free URL downloads. Previews stop at 25 MB; the card's download button always exports the whole file.
 - **Steer or stop a run** mid-flight.
 - **Sessions** — browse, search, and resume every conversation on your server; cached sessions stay readable offline.
 - **Pick your models** — switch between any model or provider your server is configured for, with recents and favorites.
@@ -62,6 +62,8 @@ Hermex is a client only — it does not ship with, host, or provision a backend.
 1. **Run the server.** Install and start `hermes-webui` on macOS, Linux, or Windows/WSL2 (Python 3.11+). Set `HERMES_WEBUI_PASSWORD`.
 2. **Make it reachable from your phone** (see options below).
 3. **Connect.** [Download Hermex](https://apps.apple.com/app/hermex/id6767006319), enter your server URL (e.g. `https://hermes.yourdomain.com`) and password, and you're in.
+
+**Running a Hermes host instead?** Hermex can also sign in to Hermes's own dashboard (`hermes dashboard`, port 9119). Onboarding's first step gives your agent a prompt that sets it up: username and password sign-in under `dashboard.basic_auth`, a persistent `dashboard.basic_auth.secret` so sign-ins survive a restart, and `dashboard.public_url` set to the address your phone uses, reached through one of the options below. Those examples use the Web UI's port 8787; substitute your dashboard's port (9119 by default) in addresses and forwarding commands. Hermes refuses to serve beyond `127.0.0.1` without that sign-in.
 
 Self-hosting the server, securing it, and keeping it reachable are your responsibility.
 

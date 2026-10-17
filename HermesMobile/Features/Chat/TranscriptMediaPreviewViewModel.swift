@@ -1,14 +1,20 @@
 import Foundation
 import SwiftUI
 
+/// One transcript media reference's preview and export. A MEDIA path downloads through the
+/// chat's `WorkspaceFileClient`, from webui's `/api/media` or a Hermes host (#1112); nil is a
+/// chat without a session to read from. A remote URL downloads through `apiClient`.
 @MainActor
 @Observable
 final class TranscriptMediaPreviewViewModel {
+    private let files: (any WorkspaceFileClient)?
     private let reference: TranscriptMediaReference
-    private let download: () async throws -> Data
+    private let apiClient: APIClient
     private var didLoad = false
     private var loadGeneration = 0
     private var originalData: Data?
+    /// The preview stopped at its 25 MB cap (a Hermes host), so export reads the whole file.
+    private var isPastPreviewCap = false
     private var temporaryVideoURL: URL?
 
     private(set) var previewData: Data?
@@ -21,22 +27,13 @@ final class TranscriptMediaPreviewViewModel {
 
     init(
         server: URL,
-        sessionID: String?,
+        files: (any WorkspaceFileClient)?,
         reference: TranscriptMediaReference,
-        apiClient: APIClient? = nil,
-        download: (() async throws -> Data)? = nil
+        apiClient: APIClient? = nil
     ) {
+        self.files = files
         self.reference = reference
-        if let download {
-            self.download = download
-        } else {
-            let client = apiClient ?? APIClient(baseURL: server)
-            let trimmedSessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let resolvedSessionID = trimmedSessionID.flatMap { $0.isEmpty ? nil : $0 }
-            self.download = {
-                try await client.transcriptMediaData(for: reference, sessionID: resolvedSessionID)
-            }
-        }
+        self.apiClient = apiClient ?? APIClient(baseURL: server)
     }
 
     var canSaveImageToPhotos: Bool {
@@ -52,7 +49,7 @@ final class TranscriptMediaPreviewViewModel {
     }
 
     var canExportMedia: Bool {
-        originalData != nil
+        originalData != nil || isPastPreviewCap
     }
 
     func load(force: Bool = false) async {
@@ -65,6 +62,7 @@ final class TranscriptMediaPreviewViewModel {
         videoFileURL = nil
         originalByteCount = nil
         originalData = nil
+        isPastPreviewCap = false
         removeTemporaryVideoFile()
 
         guard reference.isRasterImageCandidate || reference.isVideoCandidate else {
@@ -82,7 +80,7 @@ final class TranscriptMediaPreviewViewModel {
         }
 
         do {
-            let data = try await download()
+            let data = try await transcriptMediaData()
             guard !Task.isCancelled, loadGeneration == generation else { return }
             originalData = data
             originalByteCount = data.count
@@ -121,6 +119,7 @@ final class TranscriptMediaPreviewViewModel {
             guard !Task.isCancelled, loadGeneration == generation else { return }
             lastError = error
             errorMessage = error.localizedDescription
+            isPastPreviewCap = error as? BotArtifactFailure == .tooLarge
         }
     }
 
@@ -133,7 +132,7 @@ final class TranscriptMediaPreviewViewModel {
             return originalData
         }
 
-        let data = try await download()
+        let data = try await transcriptMediaData()
         try Task.checkCancellation()
         originalData = data
         originalByteCount = data.count
@@ -141,7 +140,11 @@ final class TranscriptMediaPreviewViewModel {
     }
 
     func exportPayload() async throws -> FileExportPayload {
-        let data = try await originalMediaData()
+        let data = if isPastPreviewCap, case let .localPath(path) = reference.source, let files {
+            try await files.mediaExportData(path: path)
+        } else {
+            try await originalMediaData()
+        }
         return TranscriptMediaExportSupport.payload(
             for: reference,
             data: data,
@@ -149,6 +152,15 @@ final class TranscriptMediaPreviewViewModel {
         )
     }
 
+    private func transcriptMediaData() async throws -> Data {
+        switch reference.source {
+        case let .localPath(path):
+            guard let files else { throw TranscriptMediaPreviewError.missingSessionID }
+            return try await files.mediaData(path: path)
+        case let .remoteURL(url):
+            return try await apiClient.remoteTranscriptMediaData(from: url)
+        }
+    }
 
     func cleanupTemporaryFiles() {
         loadGeneration += 1

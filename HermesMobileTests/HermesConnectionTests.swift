@@ -54,7 +54,7 @@ import XCTest
                 request.url?.path == row.path ? row.reply : nil
             } })
             var rejected: [URL] = []
-            connections.onSignInRejected = { rejected.append($0) }
+            connections.onSignInRejected = { server, _ in rejected.append(server) }
             do { try await connections.connection(for: record, server: server).signIn(); XCTFail("\(row.reply)") } catch {}
             XCTAssertEqual(rejected, Array(repeating: server, count: row.reports), "\(row.path) \(row.reply)")
         }
@@ -71,7 +71,7 @@ import XCTest
             }
         } })
         var rejected: [URL] = []
-        connections.onSignInRejected = { rejected.append($0) }
+        connections.onSignInRejected = { server, _ in rejected.append(server) }
         let http = connections.connection(for: record, server: server)
         try await http.signIn()
         XCTAssertEqual(rejected, [])
@@ -446,10 +446,388 @@ import XCTest
         XCTAssertEqual(HermesHostFixture.count("/auth/password-login"), 0)
     }
 
+    /// A browser sign-in's connection (#708) starts from the refresh token in the Keychain, not
+    /// a stale copy of the record, saves each rotated one before its access token goes out, and
+    /// sends that token as a bearer. A signed-in 401 refreshes once more and resends; a copy of
+    /// the record with an older token is still the same connection.
+    func testABrowserSignInRefreshesFromTheKeychainAndSavesTheRotatedTokenBeforeItsBearer() async throws {
+        let server = URL(string: "https://hermes.example")!
+        let keychain = InMemoryKeychainStore()
+        let saved = oauthRecord(refreshToken: "refresh-0")
+        try BotConnectionStore(keychain: keychain).save(saved, server: server)
+        // Read off the main actor, where the host answers.
+        let stored = { () -> String? in
+            let value = keychain.scopedValue(.botConnection, scope: server.absoluteString) ?? ""
+            return (try? JSONDecoder().decode(BotConnection.self, from: Data(value.utf8)))?.oauth?.refreshToken
+        }
+        var sent: [String] = [], storedAtIdentity: [String?] = [], pairings = 0
+        let connections = HermesConnections(configuration: { HermesHostFixture.configuration { request in
+            switch request.url?.path {
+            case "/auth/native/refresh":
+                let body = try? JSONDecoder().decode(BotJSON.self, from: apiTestBodyData(from: request) ?? Data())
+                XCTAssertEqual(body?["provider"].text, "nous")
+                sent.append(body?["refresh_token"].text ?? "")
+                return .json(200, .object(["access_token": .string("access-\(sent.count)"),
+                                           "refresh_token": .string("refresh-\(sent.count)"),
+                                           "provider": .string("nous"), "user_id": .string("u1")]))
+            case "/api/auth/me":
+                storedAtIdentity.append(stored())
+                return .json(200, .object(["provider": .string("nous"), "user_id": .string("u1")]))
+            case "/api/plugins/hermex-push/pairing":
+                pairings += 1
+                return pairings == 1 ? .json(401, .object(["error": .string("session_expired")])) : nil
+            default: return nil
+            }
+        } }, keychain: keychain)
+
+        let http = connections.connection(for: oauthRecord(refreshToken: "stale-copy"), server: server)
+        _ = try await http.data(.pushPairing)
+
+        XCTAssertEqual(sent, ["refresh-0", "refresh-1"], "The Keychain's token, then the rotated one")
+        XCTAssertEqual(storedAtIdentity, ["refresh-1", "refresh-2"], "Each rotated token is saved before its bearer is used")
+        XCTAssertEqual(stored(), "refresh-2")
+        let bearers = HermesHostFixture.requests.filter { $0.url?.path == "/api/plugins/hermex-push/pairing" }
+            .map { $0.value(forHTTPHeaderField: "Authorization") }
+        XCTAssertEqual(bearers, ["Bearer access-1", "Bearer access-2"])
+        XCTAssertEqual(HermesHostFixture.count("/auth/password-login"), 0)
+        XCTAssertTrue(connections.connection(for: saved, server: server) === http)
+    }
+
+    /// The host refusing the refresh token signs the server out as expired, and a rotated token
+    /// never lands on a record removed or signed in again meanwhile.
+    func testAnExpiredBrowserSignInSignsOutAndARotatedTokenNeverOverwritesANewerRecord() async throws {
+        let server = URL(string: "https://hermes.example")!
+        let keychain = InMemoryKeychainStore()
+        let store = BotConnectionStore(keychain: keychain)
+        let saved = oauthRecord(refreshToken: "refresh-0")
+        try store.save(saved, server: server)
+        let connections = HermesConnections(configuration: { HermesHostFixture.configuration { request in
+            request.url?.path == "/auth/native/refresh" ? .json(401, .object(["error": .string("session_expired")])) : nil
+        } }, keychain: keychain)
+        var rejected: [BotFailure] = []
+        connections.onSignInRejected = { _, failure in rejected.append(failure) }
+        do { try await connections.connection(for: saved, server: server).signIn(); XCTFail("The refresh was refused") } catch {
+            XCTAssertEqual(error as? BotFailure, .signInExpired)
+        }
+        XCTAssertEqual(rejected, [.signInExpired])
+        XCTAssertEqual(HermesHostFixture.count("/api/auth/me"), 0)
+
+        let newer = oauthRecord(refreshToken: "new-sign-in")
+        try store.save(newer, server: server)
+        try store.saveRotatedRefreshToken("late", replacing: "refresh-0", connection: saved.id, server: server)
+        XCTAssertEqual(try store.load(server: server)?.oauth?.refreshToken, "new-sign-in")
+        try store.remove(server: server)
+        try store.saveRotatedRefreshToken("late", replacing: "new-sign-in", connection: newer.id, server: server)
+        XCTAssertNil(try store.load(server: server))
+    }
+
+    /// A Keychain read that fails stops the sign-in before the token is spent. A write that
+    /// fails leaves the rotated token in memory, and the next rotation saves over the token
+    /// the Keychain still holds.
+    func testARotatedTokenTheKeychainRefusedIsSavedAtTheNextRotation() async throws {
+        let server = URL(string: "https://hermes.example")!
+        let keychain = RefusingKeychain()
+        try BotConnectionStore(keychain: keychain).save(oauthRecord(refreshToken: "refresh-0"), server: server)
+        var refreshes = 0, pairings = 0
+        let connections = HermesConnections(configuration: { HermesHostFixture.configuration { request in
+            switch request.url?.path {
+            case "/auth/native/refresh":
+                refreshes += 1
+                return .json(200, .object(["access_token": .string("access-\(refreshes)"),
+                                           "refresh_token": .string("refresh-\(refreshes)")]))
+            case "/api/auth/me": return .json(200, .object(["provider": .string("nous"), "user_id": .string("u1")]))
+            case "/api/plugins/hermex-push/pairing":
+                pairings += 1
+                return pairings == 1 ? .json(401, .object(["error": .string("session_expired")])) : nil
+            default: return nil
+            }
+        } }, keychain: keychain)
+        keychain.refusesScopedSaves = 1
+
+        let http = connections.connection(for: oauthRecord(refreshToken: "refresh-0"), server: server)
+        // A read that fails spends nothing; the next sign-in reads again.
+        keychain.refusesScopedLoads = 1
+        do { try await http.signIn(); XCTFail("Expected the Keychain read to fail") } catch {}
+        XCTAssertEqual(refreshes, 0)
+        _ = try await http.data(.pushPairing)
+
+        XCTAssertEqual(refreshes, 2)
+        XCTAssertEqual(try BotConnectionStore(keychain: keychain).load(server: server)?.oauth?.refreshToken, "refresh-2")
+    }
+
+    /// Switching away during a refresh retires its connection but never cancels the refresh:
+    /// the host may already have rotated the token. The next connection on that server waits
+    /// for it to save the new token and sends that one, not the spent one.
+    func testARefreshInFlightOutlivesItsRetiredConnectionAndHandsOnItsToken() async throws {
+        let server = URL(string: "https://hermes.example")!
+        let keychain = InMemoryKeychainStore()
+        let saved = oauthRecord(refreshToken: "refresh-0")
+        try BotConnectionStore(keychain: keychain).save(saved, server: server)
+        var sent: [String] = []
+        let connections = HermesConnections(configuration: { HermesHostFixture.configuration { request in
+            switch request.url?.path {
+            case "/auth/native/refresh":
+                let body = try? JSONDecoder().decode(BotJSON.self, from: apiTestBodyData(from: request) ?? Data())
+                sent.append(body?["refresh_token"].text ?? "")
+                return sent.count == 1 ? .park : .json(200, .object(["access_token": .string("access-2"),
+                                                                     "refresh_token": .string("refresh-2")]))
+            case "/api/auth/me": return .json(200, .object(["provider": .string("nous"), "user_id": .string("u1")]))
+            default: return nil
+            }
+        } }, keychain: keychain)
+        let parked = expectation(description: "first refresh at the host")
+        HermesHostFixture.onPark = { parked.fulfill() }
+        let first = connections.connection(for: saved, server: server)
+        let retired = Task { try await first.signIn() }
+        await fulfillment(of: [parked], timeout: 2)
+
+        connections.retire(server: server)
+        let next = Task { try await connections.connection(for: saved, server: server).signIn() }
+        HermesHostFixture.releaseParked(.json(200, .object(["access_token": .string("access-1"),
+                                                            "refresh_token": .string("refresh-1")])))
+        await assertStale("The retired sign-in") { try await retired.value }
+        try await next.value
+
+        XCTAssertEqual(sent, ["refresh-0", "refresh-1"])
+        XCTAssertEqual(try BotConnectionStore(keychain: keychain).load(server: server)?.oauth?.refreshToken, "refresh-2")
+    }
+
+    /// Move to Hermes's destination connection (#1265) saves the token it rotates, as the server's
+    /// own connection does, and closing it leaves that connection alone. The server's own
+    /// connection, still signed in meanwhile, refreshes next from the saved token, not the one it
+    /// held, which the host has retired.
+    func testAMoveSavesTheTokenItRotatesForTheServersOwnConnection() async throws {
+        let server = URL(string: "https://hermes.example")!
+        let keychain = InMemoryKeychainStore()
+        let store = BotConnectionStore(keychain: keychain)
+        try store.save(oauthRecord(refreshToken: "refresh-0"), server: server)
+        var sent: [String] = []
+        let connections = HermesConnections(configuration: { HermesHostFixture.configuration { request in
+            switch request.url?.path {
+            case "/auth/native/refresh":
+                let body = try? JSONDecoder().decode(BotJSON.self, from: apiTestBodyData(from: request) ?? Data())
+                sent.append(body?["refresh_token"].text ?? "")
+                return .json(200, .object(["access_token": .string("access-\(sent.count)"),
+                                           "refresh_token": .string("refresh-\(sent.count)")]))
+            case "/api/auth/me": return .json(200, .object(["provider": .string("nous"), "user_id": .string("u1")]))
+            case "/api/plugins/hermex-push/pairing":
+                // The host has since expired the own connection's first access token.
+                let expired = request.value(forHTTPHeaderField: "Authorization") == "Bearer access-1"
+                return expired ? .json(401, .object(["error": .string("session_expired")])) : nil
+            default: return nil
+            }
+        } }, keychain: keychain)
+        let own = connections.connection(for: try XCTUnwrap(store.load(server: server)), server: server)
+        try await own.signIn()
+
+        let move = MoveToHermesDestination.live(try XCTUnwrap(store.load(server: server)), connections: connections)
+        _ = try? await move.readPairing()
+        move.close()
+        XCTAssertEqual(try store.load(server: server)?.oauth?.refreshToken, "refresh-2", "The move's rotated token is saved")
+        XCTAssertFalse(own.isRetired)
+
+        _ = try await own.data(.pushPairing)
+        XCTAssertEqual(sent, ["refresh-0", "refresh-1", "refresh-2"])
+        XCTAssertEqual(try store.load(server: server)?.oauth?.refreshToken, "refresh-3")
+    }
+
+    /// A move's connection, made before the server's own is retired mid-refresh, still waits for
+    /// that refresh and sends the token it rotated to, not the one it spent (#1265).
+    func testAMovesConnectionWaitsForARefreshRetiredAfterItWasMade() async throws {
+        try await assertWaitsForARefreshRetiredLater { connections, saved, server in
+            let current = connections.connection(for: saved, server: server)
+            let own = connections.ownConnection(for: saved, server: server)
+            return (current, { connections.retire(server: server) }, own)
+        }
+    }
+
+    /// The server's own connection, made before a move's is closed mid-refresh, still waits for
+    /// that refresh and sends the token it rotated to (#1265).
+    func testTheServersOwnConnectionWaitsForAMovesRefreshClosedAfterItWasMade() async throws {
+        try await assertWaitsForARefreshRetiredLater { connections, saved, server in
+            let own = connections.ownConnection(for: saved, server: server)
+            let current = connections.connection(for: saved, server: server)
+            return (own, { connections.retire(own: own, server: server) }, current)
+        }
+    }
+
+    /// A browser sign-in's own bearer is its `Authorization`, so no custom one is admitted there:
+    /// Cloudflare Access takes its two-header form. A password connection keeps the JSON form.
+    func testABrowserSignInRefusesACustomAuthorizationHeader() throws {
+        XCTAssertThrowsError(try HermesHeaders([access, cloudflare], signsInWithBrowser: true)) {
+            XCTAssertEqual($0 as? HermesHeaders.Rejection, .authorization)
+        }
+        let accessPair = [CustomHeader(name: "CF-Access-Client-Id", value: "id"), CustomHeader(name: "CF-Access-Client-Secret", value: "s")]
+        XCTAssertEqual(try HermesHeaders(accessPair, signsInWithBrowser: true).values, accessPair)
+        var saved = oauthRecord(refreshToken: "refresh-0")
+        saved.headers = [cloudflare, access]
+        XCTAssertEqual(HermesHeaders(saved: saved).values, [], "A refused saved list sends none")
+        saved.oauth = nil
+        XCTAssertEqual(HermesHeaders(saved: saved).values, [cloudflare, access])
+    }
+
+    /// A Profile's config gets Hermex's note under `platform_hints.hermex` (#1278): written
+    /// when it is missing or differs, through a PUT the host merges, and left alone when current.
+    /// Each Profile is read once per connection.
+    func testThePlatformNoteIsWrittenOnlyWhenMissingOrChanged() async throws {
+        let rows: [(hints: BotJSON, writes: Int)] = [
+            (.null, 1),
+            (.object(["hermex": .object(["append": .string("An older note.")])]), 1),
+            (.object(["hermex": .object(["append": .string(HermesREST.platformNote)])]), 0)
+        ]
+        for row in rows {
+            HermesHostFixture.reset()
+            let http = HermesConnection(connection: record, configuration: HermesHostFixture.configuration { request in
+                request.url?.path == "/api/config" && request.httpMethod == "GET"
+                    ? .json(200, .object(["model": .string("gpt-6"), "platform_hints": row.hints])) : nil
+            })
+
+            await http.keepPlatformNote(profile: "research")
+            await http.keepPlatformNote(profile: "research")
+
+            let config = HermesHostFixture.requests.filter { $0.url?.path == "/api/config" }
+            XCTAssertEqual(config.map { $0.httpMethod ?? "" }, ["GET"] + Array(repeating: "PUT", count: row.writes), "\(row.hints)")
+            for request in config {
+                XCTAssertEqual(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems,
+                               [URLQueryItem(name: "profile", value: "research")])
+            }
+            if let write = config.first(where: { $0.httpMethod == "PUT" }) {
+                XCTAssertEqual(HermesCronFixture.body(write), .object(["config": .object(["platform_hints": .object([
+                    "hermex": .object(["append": .string(HermesREST.platformNote)])
+                ])])]))
+            }
+        }
+    }
+
+    /// A second chat on a Profile whose note is still being checked waits for that check, so the
+    /// host does not build its agent before the note is written.
+    func testASecondChatWaitsForTheNoteBeingChecked() async throws {
+        let parked = expectation(description: "the config read is parked")
+        HermesHostFixture.onPark = { parked.fulfill() }
+        let http = HermesConnection(connection: record, configuration: HermesHostFixture.configuration { request in
+            request.url?.path == "/api/config" && request.httpMethod == "GET" ? .park : nil
+        })
+        let first = Task { await http.keepPlatformNote(profile: "research") }
+        await fulfillment(of: [parked])
+
+        let second = Task {
+            await http.keepPlatformNote(profile: "research")
+            return HermesHostFixture.requests.filter { $0.url?.path == "/api/config" }.map { $0.httpMethod ?? "" }
+        }
+        HermesHostFixture.releaseParked(.json(200, .object([:])))
+        await first.value
+
+        let seenBySecond = await second.value
+        XCTAssertEqual(seenBySecond, ["GET", "PUT"], "The second returns only once the note is written, and reads nothing itself")
+    }
+
+    /// A config read that fails leaves the Profile unchecked, so the next chat tries again.
+    func testAFailedPlatformNoteReadIsTriedAgain() async throws {
+        var refusals = 1
+        let http = HermesConnection(connection: record, configuration: HermesHostFixture.configuration { request in
+            guard request.url?.path == "/api/config", request.httpMethod == "GET" else { return nil }
+            if refusals > 0 { refusals -= 1; return .json(503, .object([:])) }
+            return .json(200, .object([:]))
+        })
+
+        await http.keepPlatformNote(profile: "research")
+        await http.keepPlatformNote(profile: "research")
+        await http.keepPlatformNote(profile: "research")
+
+        XCTAssertEqual(HermesHostFixture.requests.filter { $0.url?.path == "/api/config" }.map { $0.httpMethod ?? "" },
+                       ["GET", "GET", "PUT"])
+    }
+
+    private func oauthRecord(refreshToken: String) -> BotConnection {
+        var saved = BotConnection(id: record.id, name: "Host", address: record.address, username: "u1", password: "")
+        saved.oauth = HermesOAuth(provider: "nous", userID: "u1", refreshToken: refreshToken)
+        return saved
+    }
+
+    /// `make` returns two connections to one browser sign-in's server and how to retire the first.
+    /// The first signs in until its refresh reaches the host and is retired there; the second,
+    /// made before that, signs in before the reply arrives and must send the rotated token.
+    private func assertWaitsForARefreshRetiredLater(
+        _ make: (HermesConnections, BotConnection, URL) -> (refreshing: HermesConnection, retire: () -> Void, next: HermesConnection)
+    ) async throws {
+        let server = URL(string: "https://hermes.example")!
+        let keychain = InMemoryKeychainStore()
+        let saved = oauthRecord(refreshToken: "refresh-0")
+        try BotConnectionStore(keychain: keychain).save(saved, server: server)
+        let nextStarted = expectation(description: "the second connection's sign-in at the host")
+        var sent: [String] = [], statuses = 0
+        let connections = HermesConnections(configuration: { HermesHostFixture.configuration { request in
+            switch request.url?.path {
+            case "/api/status":
+                statuses += 1
+                if statuses == 2 { nextStarted.fulfill() }
+                return nil
+            case "/auth/native/refresh":
+                let body = try? JSONDecoder().decode(BotJSON.self, from: apiTestBodyData(from: request) ?? Data())
+                sent.append(body?["refresh_token"].text ?? "")
+                return sent.count == 1 ? .park : .json(200, .object(["access_token": .string("access-2"),
+                                                                     "refresh_token": .string("refresh-2")]))
+            case "/api/auth/me": return .json(200, .object(["provider": .string("nous"), "user_id": .string("u1")]))
+            default: return nil
+            }
+        } }, keychain: keychain)
+        let parked = expectation(description: "first refresh at the host")
+        HermesHostFixture.onPark = { parked.fulfill() }
+        let (refreshing, retire, next) = make(connections, saved, server)
+        let retired = Task { try await refreshing.signIn() }
+        await fulfillment(of: [parked], timeout: 2)
+
+        retire()
+        let signedIn = Task { try await next.signIn() }
+        await fulfillment(of: [nextStarted], timeout: 2)
+        HermesHostFixture.releaseParked(.json(200, .object(["access_token": .string("access-1"),
+                                                            "refresh_token": .string("refresh-1")])))
+        await assertStale("The retired sign-in") { try await retired.value }
+        try await signedIn.value
+
+        XCTAssertEqual(sent, ["refresh-0", "refresh-1"])
+        XCTAssertEqual(try BotConnectionStore(keychain: keychain).load(server: server)?.oauth?.refreshToken, "refresh-2")
+    }
+
+    /// The fixture keeps the login's POST on the redirected request, as a 307 or 308 would,
+    /// so the guard must refuse it before the password reaches the other host.
+    func testALoginRedirectedToAnotherOriginNeverSendsThePassword() async throws {
+        let elsewhere = try XCTUnwrap(URL(string: "https://elsewhere.example/auth/password-login"))
+        let http = HermesConnection(connection: record, configuration: HermesHostFixture.configuration { request in
+            request.url?.host == "hermes.example" && request.url?.path.hasSuffix("password-login") == true
+                ? .redirect(elsewhere) : nil
+        })
+        do { try await http.signIn(); XCTFail("Expected the refused redirect to be blocked") }
+        catch { XCTAssertEqual(error as? BotFailure, .blocked) }
+        XCTAssertNotNil(HermesHostFixture.requests.first { $0.url?.path.hasSuffix("password-login") == true })
+        XCTAssertFalse(HermesHostFixture.requests.contains { $0.url?.host == elsewhere.host })
+    }
+
     private func assertStale(_ label: String, _ body: () async throws -> Void) async {
         do { try await body(); XCTFail("\(label): expected stale") }
         catch { XCTAssertEqual(error as? BotFailure, .stale, label) }
     }
+}
+
+/// An in-memory Keychain that refuses the next `refusesScopedSaves` scoped writes and the
+/// next `refusesScopedLoads` scoped reads.
+private final class RefusingKeychain: KeychainStoring {
+    private let base = InMemoryKeychainStore()
+    var refusesScopedSaves = 0
+    var refusesScopedLoads = 0
+
+    func save(_ value: String, forKey key: KeychainStore.Key) throws { try base.save(value, forKey: key) }
+    func load(_ key: KeychainStore.Key) throws -> String? { try base.load(key) }
+    func delete(_ key: KeychainStore.Key) throws { try base.delete(key) }
+    func save(_ value: String, forKey key: KeychainStore.Key, scope: String) throws {
+        if refusesScopedSaves > 0 { refusesScopedSaves -= 1; throw URLError(.cannotWriteToFile) }
+        try base.save(value, forKey: key, scope: scope)
+    }
+    func load(_ key: KeychainStore.Key, scope: String) throws -> String? {
+        if refusesScopedLoads > 0 { refusesScopedLoads -= 1; throw URLError(.cannotOpenFile) }
+        return try base.load(key, scope: scope)
+    }
+    func delete(_ key: KeychainStore.Key, scope: String) throws { try base.delete(key, scope: scope) }
 }
 
 /// A scripted direct Hermes host. `script` may answer a request by path; nil gives the
@@ -457,7 +835,8 @@ import XCTest
 /// runs under the fixture's lock, and `script(_:)` changes its state under the same lock.
 /// `HermesGatewayTests` scripts its host with it too.
 final class HermesHostFixture: URLProtocol {
-    enum Reply { case json(Int, BotJSON), data(Int, [String: String], Data), fail(URLError), redirect(URL), park }
+    /// `body` answers with exactly these bytes, which `json` can't when they are empty.
+    enum Reply { case json(Int, BotJSON), body(Int, Data), fail(URLError), redirect(URL), park }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var answer: ((URLRequest) -> Reply?)?
@@ -507,24 +886,26 @@ final class HermesHostFixture: URLProtocol {
         let url = request.url!
         switch reply {
         case .json(let status, let body):
+            respond(.body(status, (try? JSONEncoder().encode(body)) ?? Data()))
+        case .body(let status, let data):
             let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1",
                                            headerFields: ["Content-Type": "application/json"])!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: (try? JSONEncoder().encode(body)) ?? Data())
-            client?.urlProtocolDidFinishLoading(self)
-        case .data(let status, let headers, let data):
-            let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)
         case .fail(let error):
             client?.urlProtocol(self, didFailWithError: error)
         case .redirect(let target):
-            let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1",
+            // A 307: the follow-up keeps the method, as a 307 or 308 does on the wire.
+            let response = HTTPURLResponse(url: url, statusCode: 307, httpVersion: "HTTP/1.1",
                                            headerFields: ["Location": target.absoluteString])!
             var followUp = URLRequest(url: target)
+            followUp.httpMethod = request.httpMethod
             followUp.allHTTPHeaderFields = request.allHTTPHeaderFields
             client?.urlProtocol(self, wasRedirectedTo: followUp, redirectResponse: response)
+            // A refused redirect ends with the 3xx itself, as it does on the wire.
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocolDidFinishLoading(self)
         case .park: break
         }
     }
