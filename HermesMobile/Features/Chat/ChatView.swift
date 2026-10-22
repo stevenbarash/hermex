@@ -815,21 +815,22 @@ struct ChatView: View {
         )
     }
 
-    /// The capped preview download behind `hermesFilePreviewItem`. A sent chip keeps
-    /// its host download (#1030). A MEDIA document's local path reads through the
-    /// chat's `WorkspaceFileClient` (`mediaData`, #1112); a remote document URL is a
-    /// public, credential-free fetch, never either server's auth. Exporting the whole
-    /// file, over the cap included, stays on the card's own download action.
+    /// The capped preview download behind `hermesFilePreviewItem`. A sent chip and a MEDIA
+    /// document's host path download from this chat's attach, as the card's export does, so a
+    /// result that lands after a reattach is dropped (#1030). A remote MEDIA document is a
+    /// public, cookie-less fetch with neither server's credentials. The whole file, past the
+    /// cap included, exports from the card's own download button.
     private func hermesFilePreviewData(for item: HermesFilePreviewItem) async throws -> Data {
-        if item.isSentAttachment, case let .localPath(path) = item.reference.source {
-            return try await viewModel.hermesAttachmentData(path: path)
-        }
+        if item.isSentAttachment { return try await viewModel.hermesAttachmentData(path: item.reference.rawReference) }
         switch item.reference.source {
         case let .localPath(path):
-            guard let files = transcriptMediaFiles else { throw TranscriptMediaPreviewError.missingSessionID }
-            return try await files.mediaData(path: path)
+            return try await viewModel.hermesAttachmentData(path: path)
         case let .remoteURL(url):
-            return try await PublicArtifactDownload.data(from: url)
+            // A refusal there is not Hermes's sign-in, which `BotFailure.rejected` would say.
+            do {
+                return try await BotArtifactDownload.data(session: APIClient.sharedPublicMediaSession,
+                                                          request: URLRequest(url: url))
+            } catch is BotFailure { throw BotArtifactFailure.unavailable }
         }
     }
 
@@ -4396,8 +4397,8 @@ private struct HermesPersonalityConfirmationModifier: ViewModifier {
     }
 }
 
-/// One Hermes native preview presentation, for a sent chip or a MEDIA document.
-/// A sent chip downloads as a sent file; a MEDIA document through the media loader.
+/// One Hermes native preview presentation, for a sent chip or a MEDIA document. A sent chip's
+/// path downloads from the host even when it is a URL (`BotArtifactReference`).
 private struct HermesFilePreviewItem: Identifiable {
     let id = UUID()
     let reference: TranscriptMediaReference

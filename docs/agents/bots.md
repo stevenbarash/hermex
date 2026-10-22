@@ -644,25 +644,16 @@ only the typed text. A chip has a name and no path, so tapping one shows the loc
 when this phone sent it and otherwise says it has no server path; audio shows as a
 file, not a player.
 
-Assistant `MEDIA:` documents in Hermes sessions open in the same native preview
-as sent files (`BotArtifactPreview`): PDFs and the existing
-`BinaryFilePreview.quickLook` format allow-list. A local path's preview downloads
-through the chat's `WorkspaceFileClient` (`mediaData`, capped, under the active
-Profile and stored session key). The card keeps its own download button beside
-the preview: it exports the whole file through the uncapped MEDIA export without
-starting or waiting for a preview download, so a document over the preview cap
-still saves and shares. Unsupported files keep the download-only row. Webui
-sessions' media rendering and transport are unchanged. Native document cards
-follow the interface's layout direction, including their forward chevron. Image,
-audio, video and webui media keep the existing LTR anchor inside RTL messages.
-
-Remote document URLs are fetched as URLs, never passed to `/api/fs/download`.
-They use a public ephemeral session with no cookies, stored HTTP credentials,
-Hermes sign-in or either server's proxy headers, even at the Hermes origin.
-Embedded URL credentials are refused, as are redirects and non-200 responses.
-The same streaming 25 MB cap applies with or without `Content-Length`;
-cancellation and preview dismissal discard late results. Remote image/audio/video
-URLs retain their existing media URL policy. Ordinary external links remain links.
+Assistant `MEDIA:` documents in Hermes sessions (`isHermesDocumentCandidate`: the
+`BinaryFilePreview.quickLook` formats) open in the same native preview as sent files
+(`BotArtifactPreview`, capped at 25 MB). A host path's preview downloads as a sent file
+does, from the chat's attach. A remote URL's preview is a public fetch on the cookie-less
+`APIClient.sharedPublicMediaSession`, with neither server's credentials or headers and no
+redirects. The row's download button is the uncapped MEDIA export every other file uses
+(`ChatViewModel.transcriptMediaData`), whose remote URLs keep the webui media policy, so a
+document past the preview cap still saves and shares. Other files keep the download-only
+row, and webui sessions are unchanged. A document's row follows the interface direction;
+other media keeps its LTR anchor inside RTL messages (#259).
 
 Dictation in a Hermes session follows the Dictation Provider setting as on webui
 (#1071), but `HermesTranscription` uploads one JSON `POST /api/audio/transcribe` for

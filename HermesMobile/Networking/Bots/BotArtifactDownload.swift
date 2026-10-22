@@ -24,8 +24,8 @@ final class BotArtifactRedirectGuard: NSObject, URLSessionTaskDelegate, @uncheck
 }
 
 /// Reads one artifact from a `HermesREST.downloadArtifact` request, or one `HermesREST.speak`
-/// reply, on the session `HermesConnection.authorized` passes in. No webui endpoint or shared
-/// URLSession. `limit` caps a preview's bytes; nil reads the whole file, as an export does
+/// reply, on the session `HermesConnection.authorized` passes in; a remote MEDIA document's
+/// preview (#145) reads on the cookie-less `APIClient.sharedPublicMediaSession`. No webui endpoint. `limit` caps a preview's bytes; nil reads the whole file, as an export does
 /// (#1112). An empty body is a failed read unless `allowsEmpty`, which only a workspace file's
 /// Save and Share pass: an empty file is a real file there, but never a real image or speech.
 enum BotArtifactDownload {
@@ -69,34 +69,5 @@ enum BotArtifactDownload {
             }
         } catch { return false }
         return (try? JSONDecoder().decode(BotJSON.self, from: body))?["detail"].text == "Path points to a directory"
-    }
-}
-
-/// Remote Hermes MEDIA documents are public URL downloads, even at the Hermes
-/// origin. No cookies, stored HTTP credentials, proxy headers, or redirects.
-/// Reuses the native artifact reader's streaming 25 MB limit and cancellation.
-enum PublicArtifactDownload {
-    static func configuration() -> URLSessionConfiguration {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpCookieStorage = nil
-        configuration.httpCookieAcceptPolicy = .never
-        configuration.httpShouldSetCookies = false
-        configuration.urlCredentialStorage = nil
-        configuration.urlCache = nil
-        return configuration
-    }
-
-    private static let sharedSession = URLSession(configuration: configuration())
-
-    static func data(from url: URL, session: URLSession? = nil) async throws -> Data {
-        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-              url.host != nil, url.user == nil, url.password == nil else {
-            throw BotArtifactFailure.invalidReference
-        }
-        var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.httpShouldHandleCookies = false
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        return try await BotArtifactDownload.data(session: session ?? sharedSession, request: request)
     }
 }
