@@ -83,6 +83,10 @@ import Foundation
 /// `/auth/native/refresh` answer the tokens in the body and set no cookie, a bearer passes the
 /// gate on every `/api/*` route, an expired or unknown one is 401 `{error: "session_expired"}`,
 /// and the WebSocket upgrades still present a ticket, which the bearer can mint.
+/// The session write fence (#1300) is read at hermes-agent main, past the pin
+/// (`web_server_sessions.py` `_mutate_session_request`): a PATCH or an import without
+/// `request_id` and `expected_revision` is 409 `client_upgrade_required: …`, with one of them
+/// 409 `mutation_identity_required`, and the 0.21.5 pin has no `mutation-snapshot` route.
 enum HermesREST: Equatable, Sendable {
     /// What the agent of a Hermex session is told about the screen it writes to (#1278): the
     /// host appends it to the system prompt of every agent running as `HermesCall.source`.
@@ -105,6 +109,10 @@ enum HermesREST: Equatable, Sendable {
 
     /// Public, so it reads the host before any credential is sent.
     case status
+    /// The dashboard's own page, whose script carries the session token an open dashboard
+    /// (`HermesSignInMethod.open`, #1314) checks on every `/api/*` route (`pageToken(in:)`).
+    /// Public.
+    case dashboardPage
     case login(username: String, password: String)
     /// Trades a browser sign-in's refresh token for a new access token and a rotated refresh
     /// token (#708): `{access_token, refresh_token, token_type, expires_at, provider, user_id}`,
@@ -158,26 +166,32 @@ enum HermesREST: Equatable, Sendable {
     /// Each page also brings every pinned row it missed, archived ones included. `archived`
     /// reads the Archived screen's page instead (#1048): only archived rows, hidden Bot Chats
     /// included, plus the same pinned back-fill.
-    case sessionList(profile: String, offset: Int, archived: Bool = false)
+    case sessionList(profile: String, offset: Int, archived: Bool = false, scheduled: Bool = false)
     /// One page of every session `profile` lists for Move to Hermes's scan (#1213): archived,
     /// empty and machine-run rows included, newest-created first. A session made or deleted
     /// mid-scan shifts later pages, so a row can repeat or slip past; the scan reads any id it
     /// didn't list by that id.
     case sessionScan(profile: String, offset: Int)
-    /// One change to a session, with `profile` in the body (#1046, #1048).
-    case updateSession(key: String, profile: String, change: HermesSessionChange)
+    /// One change to a session, with `profile` in the body (#1046, #1048), and the write fence's
+    /// identity (#1300) on a host that has the fence; nil sends the change alone.
+    case updateSession(key: String, profile: String, change: HermesSessionChange, identity: HermesSessionWriteIdentity?)
+    /// The write fence's counters for that session (#1300): `{session_id, exists, runtime_revision,
+    /// runtime_generation}`, 200 with `exists: false` when `profile` has no such session. A host
+    /// from before the fence answers its catch-all 404 (`HermexPushPairing` names both).
+    case sessionMutationSnapshot(key: String, profile: String)
     /// That exact session's row and every message, unredacted, as one JSON object (#1048).
     case sessionExport(key: String, profile: String)
     /// That exact session's stored row (#1051), or 404 `{detail}` when `profile` has none.
     case sessionRow(key: String, profile: String)
     /// Imports sessions as an export holds them (#1051), each under the id it carries. `body` is
     /// the JSON `{sessions, profile}`, encoded by the caller off the main actor: it carries every
-    /// message.
-    case importSessions(body: Data)
+    /// message. `identity` is spliced in after its `{` rather than encoded with it; its revision
+    /// is 0, the host's revision for an anchor (`sessions[0].id`) it doesn't have yet (#1300).
+    case importSessions(body: Data, identity: HermesSessionWriteIdentity)
     /// `profile`'s sessions matching `query` (#1053): id matches, then message-content matches,
     /// at most `limit` (the host clamps it to 1…`sessionSearchMaximum`), archived and hidden ones
     /// included, without machine-run rows.
-    case sessionSearch(query: String, profile: String, limit: Int = sessionSearchLimit)
+    case sessionSearch(query: String, profile: String, limit: Int = sessionSearchLimit, scheduled: Bool = false)
     /// Every Profile's scheduled Tasks, paused and completed included: a bare array.
     case cronJobs
     /// Creates a Task in `profile`, or in the host's default Profile when nil.
@@ -331,6 +345,7 @@ enum HermesREST: Equatable, Sendable {
     func request(base: URL) throws -> URLRequest {
         switch self {
         case .status: return Self.get(base.appendingPathComponent("api/status"))
+        case .dashboardPage: return Self.get(base.appendingPathComponent(""))
         case .health: return Self.get(base.appendingPathComponent("api/health"))
         case .updateCheck(let force):
             guard var parts = URLComponents(url: base.appendingPathComponent("api/hermes/update/check"),
@@ -427,7 +442,7 @@ enum HermesREST: Equatable, Sendable {
             }
             guard let url = parts.url else { throw BotFailure.invalidAddress }
             return Self.get(url)
-        case .sessionList(let profile, let offset, let archived):
+        case .sessionList(let profile, let offset, let archived, let scheduled):
             guard !profile.isEmpty, offset >= 0,
                   var parts = URLComponents(url: base.appendingPathComponent("api/sessions"), resolvingAgainstBaseURL: false)
             else { throw BotFailure.invalidAddress }
@@ -437,9 +452,10 @@ enum HermesREST: Equatable, Sendable {
                 URLQueryItem(name: "profile", value: profile), URLQueryItem(name: "order", value: "recent"),
                 URLQueryItem(name: "archived", value: archived ? "only" : "exclude"),
                 URLQueryItem(name: "limit", value: String(Self.sessionPageSize)), URLQueryItem(name: "offset", value: String(offset))
-            ] + (archived ? [] : [URLQueryItem(name: "min_messages", value: "1")]) + [
-                URLQueryItem(name: "exclude_sources", value: "cron,kanban,oneshot,subagent,tool")
-            ]
+            ] + (archived ? [] : [URLQueryItem(name: "min_messages", value: "1")]) + (scheduled ? [
+                URLQueryItem(name: "sources", value: "cron"),
+                URLQueryItem(name: "exclude_sources", value: "kanban,oneshot,subagent,tool")
+            ] : [URLQueryItem(name: "exclude_sources", value: archived ? "kanban,oneshot,subagent,tool" : "cron,kanban,oneshot,subagent,tool")])
             guard let url = parts.url else { throw BotFailure.invalidAddress }
             return Self.get(url)
         case .sessionScan(let profile, let offset):
@@ -453,31 +469,36 @@ enum HermesREST: Equatable, Sendable {
             ]
             guard let url = parts.url else { throw BotFailure.invalidAddress }
             return Self.get(url)
-        case .updateSession(let key, let profile, let change):
+        case .updateSession(let key, let profile, let change, let identity):
             guard Self.isSegment(key), !profile.isEmpty else { throw BotFailure.invalidAddress }
             return try Self.send("PATCH", base.appendingPathComponent("api/sessions").appendingPathComponent(key),
-                                 [change.field: change.value, "profile": .string(profile)])
+                                 [change.field: change.value, "profile": .string(profile)].merging(identity?.fields ?? [:]) { $1 })
+        case .sessionMutationSnapshot(let key, let profile):
+            guard Self.isSegment(key), !profile.isEmpty else { throw BotFailure.invalidAddress }
+            return Self.get(try Self.url(base, "api/sessions/\(key)/mutation-snapshot", profile: profile))
         case .sessionExport(let key, let profile):
             guard Self.isSegment(key), !profile.isEmpty else { throw BotFailure.invalidAddress }
             return Self.get(try Self.url(base, "api/sessions/\(key)/export", profile: profile))
         case .sessionRow(let key, let profile):
             guard Self.isSegment(key), !profile.isEmpty else { throw BotFailure.invalidAddress }
             return Self.get(try Self.url(base, "api/sessions/\(key)", profile: profile))
-        case .importSessions(let body):
+        case .importSessions(let body, let identity):
+            guard body.first == UInt8(ascii: "{") else { throw BotFailure.unsupported }
             var request = Self.bare("POST", base.appendingPathComponent("api/sessions/import"))
-            request.httpBody = body
+            request.httpBody = Data("{".utf8) + identity.leadingMembers + body.dropFirst()
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             return request
-        case .sessionSearch(let query, let profile, let limit):
+        case .sessionSearch(let query, let profile, let limit, let scheduled):
             guard !query.isEmpty, !profile.isEmpty,
                   var parts = URLComponents(url: base.appendingPathComponent("api/sessions/search"), resolvingAgainstBaseURL: false)
             else { throw BotFailure.invalidAddress }
             // The same sources the list leaves out, so a search never finds a row it never shows.
             parts.queryItems = [
                 URLQueryItem(name: "q", value: query), URLQueryItem(name: "profile", value: profile),
-                URLQueryItem(name: "limit", value: String(limit)),
-                URLQueryItem(name: "exclude_sources", value: "cron,kanban,oneshot,subagent,tool")
-            ]
+                URLQueryItem(name: "limit", value: String(limit))
+            ] + (scheduled ? [URLQueryItem(name: "sources", value: "cron"),
+                              URLQueryItem(name: "exclude_sources", value: "kanban,oneshot,subagent,tool")]
+                 : [URLQueryItem(name: "exclude_sources", value: "cron,kanban,oneshot,subagent,tool")])
             // The host reads a bare `+` as a space, so a typed one ("c++") is escaped.
             parts.percentEncodedQuery = parts.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
             guard let url = parts.url else { throw BotFailure.invalidAddress }
@@ -675,32 +696,57 @@ enum HermesREST: Equatable, Sendable {
         return try send(method, url, body)
     }
 
-    /// The gateway socket's upgrade: the `ws`/`wss` URL matching the address's scheme,
-    /// offering `hermes-gateway-v1` and the single-use ticket as subprotocols. A request's
-    /// `Sec-WebSocket-Protocol` header is where `URLSessionWebSocketTask` takes them from.
-    static func gatewayUpgrade(base: URL, ticket: String) throws -> URLRequest {
+    /// What a socket upgrade presents to the host's check, which runs before the socket opens.
+    enum UpgradePass: Equatable, Sendable {
+        /// A single-use ticket minted at `ticket`, for a host with sign-in.
+        case ticket(String)
+        /// An open dashboard's session token (#1314), presented as `?token=`. The host reads
+        /// tickets only behind its sign-in, and accepts this one without a subprotocol.
+        case pageToken(String)
+    }
+
+    /// The gateway socket's upgrade: the `ws`/`wss` URL matching the address's scheme. A ticket
+    /// goes with `hermes-gateway-v1` as subprotocols, which `URLSessionWebSocketTask` takes from
+    /// the request's `Sec-WebSocket-Protocol` header; a page token goes as `?token=`, with none.
+    static func gatewayUpgrade(base: URL, pass: UpgradePass) throws -> URLRequest {
         guard var parts = URLComponents(url: base.appendingPathComponent("api/ws"), resolvingAgainstBaseURL: false)
         else { throw BotFailure.unsupported }
         parts.scheme = base.scheme == "https" ? "wss" : "ws"
+        if case .pageToken(let token) = pass { parts.queryItems = [URLQueryItem(name: "token", value: token)] }
         guard let url = parts.url else { throw BotFailure.invalidAddress }
         var request = URLRequest(url: url)
-        request.setValue("hermes-gateway-v1, hermes-gateway-ticket." + ticket, forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        if case .ticket(let ticket) = pass {
+            request.setValue("hermes-gateway-v1, hermes-gateway-ticket." + ticket, forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        }
         return request
     }
 
     /// A Board's Kanban event socket (#1045): `/api/plugins/kanban/events` on the `ws`/`wss`
-    /// URL matching the address's scheme, presenting the single-use ticket as `?ticket=`. It
-    /// offers no subprotocol, because the host accepts without echoing one. The host pins the
-    /// socket to `board` and sends only events after `since`.
-    static func kanbanEventsUpgrade(base: URL, board: String, since: Int, ticket: String) throws -> URLRequest {
+    /// URL matching the address's scheme, presenting a ticket as `?ticket=` or a page token as
+    /// `?token=`. It offers no subprotocol, because the host accepts without echoing one. The
+    /// host pins the socket to `board` and sends only events after `since`.
+    static func kanbanEventsUpgrade(base: URL, board: String, since: Int, pass: UpgradePass) throws -> URLRequest {
         guard var parts = URLComponents(url: base.appendingPathComponent("api/plugins/kanban/events"),
                                         resolvingAgainstBaseURL: false)
         else { throw BotFailure.invalidAddress }
         parts.scheme = base.scheme == "https" ? "wss" : "ws"
+        let credential = switch pass {
+        case .ticket(let ticket): URLQueryItem(name: "ticket", value: ticket)
+        case .pageToken(let token): URLQueryItem(name: "token", value: token)
+        }
         parts.queryItems = [URLQueryItem(name: "board", value: board), URLQueryItem(name: "since", value: String(max(0, since))),
-                            URLQueryItem(name: "ticket", value: ticket)]
+                            credential]
         guard let url = parts.url else { throw BotFailure.invalidAddress }
         return URLRequest(url: url)
+    }
+
+    /// The session token in `dashboardPage`'s body: upstream writes
+    /// `window.__HERMES_SESSION_TOKEN__="<token>";`, quoted by hand or by `json.dumps`. Nil for
+    /// a page without one, such as a dashboard behind its sign-in, which never injects it.
+    static func pageToken(in page: Data) -> String? {
+        guard let html = String(data: page, encoding: .utf8),
+              let match = html.firstMatch(of: /__HERMES_SESSION_TOKEN__\s*=\s*"([^"\\]+)"/) else { return nil }
+        return String(match.1)
     }
 
     private static func get(_ url: URL) -> URLRequest { bare("GET", url) }
@@ -791,6 +837,22 @@ enum HermesREST: Equatable, Sendable {
         request.httpBody = try JSONEncoder().encode(BotJSON.object(body))
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return request
+    }
+}
+
+/// What hermes-agent's write fence (#1300) asks of a REST session write: a request id the host
+/// dedupes a retried write on, and the `runtime_revision` the write expects the session to be at.
+/// A stale revision is refused (409 `revision_conflict`), so an edit reads it right before writing.
+struct HermesSessionWriteIdentity: Equatable, Sendable {
+    var requestID = UUID()
+    let expectedRevision: Int
+
+    fileprivate var fields: [String: BotJSON] {
+        ["request_id": .string(requestID.uuidString), "expected_revision": .number(Double(expectedRevision))]
+    }
+
+    var leadingMembers: Data {
+        Data(#""request_id":"\#(requestID.uuidString)","expected_revision":\#(expectedRevision),"#.utf8)
     }
 }
 

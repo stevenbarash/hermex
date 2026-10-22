@@ -73,8 +73,9 @@ server is #707's; a copy gets a fresh UUID.
 Onboarding's Connect page and Settings → Add Server are one connect form
 (`OnboardingViewModel`, #900). Its first Connect for an address reads the public
 `/api/status` there, parsed by `BotConnection.address(_:)` and sent with the form's
-headers on a `HermesConnection` of its own. A JSON object carrying `auth_required` is a
-Hermes dashboard: username and password appear, and the next Connect signs in once
+headers on a `HermesConnection` of its own. A JSON object carrying the `auth_required` flag is a
+Hermes dashboard, and `HermesSignInMethod` reads how it signs in: a password, the browser
+(below) or none (below). For a password, username and password appear, and the next Connect signs in once
 (`HermesConnection.signIn()`, so the version gate, install check and #880's copy apply),
 then calls `addHermesServer`. Hermes' own Host-header 400 and `.blocked` show their
 advice and stop, and a mode switch keeps that advice. Anything else, including an
@@ -118,6 +119,31 @@ survived 82 s of suspension; a reclaimed one shows "can't connect" in the sheet,
 signing in again recovers) and a revoke at sign-out (sign-out deletes the record and
 its refresh token).
 
+### No sign-in (#1314)
+
+A dashboard bound to `127.0.0.1` without `dashboard.public_url` reports `auth_required:
+false`; upstream runs without a password on no other bind. A phone reaches it only through
+something that forwards to loopback, such as `tailscale serve`, Caddy or `cloudflared`.
+The connect form and a Hermes server's own sign-in form hide the username and password,
+enable Connect, and warn that anyone who reaches the address can use the agent; the
+server's Settings page keeps that warning while its record has no username and no
+browser sign-in (`BotConnection.hasNoCredentials`). Its sign-in reads the dashboard's page
+(`GET /`, public, with the connection's headers), takes the token its script sets as
+`window.__HERMES_SESSION_TOKEN__`, and proves it with a gated read
+(`/api/profiles/active`): at the 0.21.5 pin `/api/auth/me` refuses this mode, since only
+the password gate sets a session. The token is held in memory only and sent as
+`X-Hermes-Session-Token`, never `Authorization: Bearer`, which a proxy's basic auth may
+hold, and a cross-origin redirect drops it. `POST /api/auth/ws-ticket` is refused here,
+so both socket upgrades present the token as `?token=` with no subprotocol
+(`HermesREST.UpgradePass`), which the host checks without one
+(`web_server_chat.py` `_ws_auth_reason`), each after a gated read. A host restart replaces
+the token: the 401 that follows reads the page again and resends once, as for any
+signed-in 401, and the read before an upgrade does the same, since a refused upgrade
+can't say why. A record saved without credentials meeting the host with its sign-in on,
+or one saved with credentials meeting it without, fails with `.signInChanged`, which signs
+the active Hermes server out to its sign-in form, as a refused password does. The form saves
+what the host now asks for, so only a record without credentials shows the open warning.
+
 Debug and Hermex Branch builds have Settings → Testing → "Browser sign-in on password
 hosts" (`HermesBrowserSignIn.isForcedForTesting`): a host that also offers `basic` then
 signs in through the browser too, its `/login` form inside the sheet, which exercises
@@ -159,7 +185,7 @@ an ephemeral cookie jar, a single-flight sign-in, and the only path Bot HTTP
 requests and gateway upgrades are sent through. `HermesConnections` gives every
 consumer of the active server's saved connection (inbox, chats, rooms, creator,
 editor and push provisioning's `BotDashboardClient`) the same instance, so they sign
-in once; a reconnect only mints a new ticket. The registry holds its one entry weakly
+in once; a reconnect only mints a new ticket, or checks an open dashboard's page token. The registry holds its one entry weakly
 and keys it by configured server and connection UUID. A request for another server
 or UUID, or for the same UUID with a new address, account, password or headers,
 retires the old connection first: its sign-in in flight stops and its late replies
@@ -288,7 +314,8 @@ asset) are encoded there. `HermesCall.params()` is the only way to the wire and
 runs admission first, so the "typed exception" rules in `bots.md` hold for every caller;
 `HermesGateway` still runs `validateDispatch` at the socket write and maps errors,
 cancellation and timeouts. Password login requires the basic auth gate, verifies identity,
-and each socket gets a fresh single-use ticket. The upgrade is a `URLRequest`
+and each socket gets a fresh single-use ticket, or on a dashboard with no sign-in its page
+token as `?token=` (§ No sign-in). The upgrade is a `URLRequest`
 (`HermesREST.gatewayUpgrade`) offering the `hermes-gateway-v1` and ticket
 subprotocols in its `Sec-WebSocket-Protocol` header, which is where
 `URLSessionWebSocketTask` takes them from a request; the host splits that header
@@ -411,7 +438,7 @@ describe RPC, and `gateway.ready` lists no methods.
 
 | Probe | Answer | Meaning |
 | :--- | :--- | :--- |
-| `GET /api/status` (public) | JSON object carrying `auth_required` | A Hermes dashboard; its `version` meets the minimum or the sign-in stops (connect form, `HermesConnection.signIn()`). |
+| `GET /api/status` (public) | JSON object carrying the `auth_required` flag | A Hermes dashboard; its `version` meets the minimum or the sign-in stops (connect form, `HermesConnection.signIn()`). `false` signs in with the page's token (§ No sign-in). |
 | `GET /api/status` | Hermes' Host-header 400, or `.blocked` (an access proxy's own sign-in) | The connect form shows its advice and stops; it does not try webui. |
 | `GET /api/status` | anything else | Not Hermes: the connect form goes on to the webui path. |
 | `client.capabilities` in the handshake | -32601 | A host before 0.21.4; connect anyway. |
@@ -422,6 +449,23 @@ describe RPC, and `gateway.ready` lists no methods.
 | `GET /api/plugins/<name>/…` | 404 `{"detail": "Plugin not found"}` | The plugin is off or not installed (`HermexPushPlugin.missingRoute`, Kanban). |
 | `GET /api/plugins/<name>/…` | 404 `{"detail": "No such API endpoint: …"}` | The dashboard never mounted the plugin's routes: it is new on disk and the host needs a restart, or the host lacks it (`kanban.md`, Absent plugin). |
 | `GET /api/plugins/hermex-push/capabilities` | `{plugin_version, routes}` / any 404 | The companion routes the loaded plugin mounts / none, so the feature doesn't show (`bots.md` § Push provisioning). |
+| `GET /api/sessions/{id}/mutation-snapshot` | 200 / a catch-all 404 (`No such API endpoint`, or `serve`'s `Headless backend`) | The host fences session writes / it is older and takes them bare (§ Session write fence). |
+
+## Session write fence
+
+hermes-agent fences REST session writes (#1300): `PATCH /api/sessions/{id}` and
+`POST /api/sessions/import` must carry `request_id` and `expected_revision`, or the host answers
+409 `client_upgrade_required` (neither) or `mutation_identity_required` (one). `BotClient` sends a
+fresh UUID as `request_id` on every write. A PATCH's `expected_revision` is the session's
+`runtime_revision`, read from `mutation-snapshot` right before the write, because any activity on
+the session moves it and a cached list row's value goes stale. An import always sends 0, the
+revision of an anchor id the host doesn't have. Hermex never sends `expected_generation`. When the
+snapshot route answers a catch-all 404 (`hermes dashboard`'s "No such API endpoint" or `hermes serve`'s
+"Headless backend…"), the host predates the fence and the PATCH goes out bare;
+older hosts ignore the extra fields on an import. A 409 (`revision_conflict`, `stale_generation`,
+`admission_conflict`, `session_busy`, or an upgrade reason) is a `HermesSessionFenceRefusal` and is
+never resent: the row action rolls back and reloads, and Move to Hermes leaves the batch uncertain
+for its next run.
 
 ## Plugin routes need a host restart
 

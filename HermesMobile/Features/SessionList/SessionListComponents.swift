@@ -1,6 +1,13 @@
 import SwiftUI
 import UIKit
 
+/// Hermes home owns a split only at regular width; pushed lists keep their caller's stack.
+enum HermesHomeLayout {
+    static func usesSplit(isHome: Bool, horizontalSizeClass: UserInterfaceSizeClass?) -> Bool {
+        isHome && horizontalSizeClass == .regular
+    }
+}
+
 /// The regular-width shell (iPad, landscape Plus/Max). A sidebar root selection
 /// bumps `rootRevision`, which rebuilds only the detail root and pops any screen
 /// pushed above it (#116). The sidebar keeps its identity, scroll position, and
@@ -1005,7 +1012,7 @@ struct ScheduledSessionsDisclosure: View {
                 .transition(SessionListMotion.disclosureContentTransition(reduceMotion: reduceMotion))
             }
 
-            if !isSearchActive && sessions.count > 5 {
+            if !isSearchActive && totalCount > 5 {
                 HapticButton(action: viewAll) {
                     HStack(spacing: 12) {
                         Image(systemName: "magnifyingglass")
@@ -1030,6 +1037,7 @@ struct ScheduledSessionsDisclosure: View {
 }
 
 struct ScheduledSessionsView: View {
+    @Environment(\.scenePhase) private var scenePhase
     let viewModel: SessionListViewModel
     let showsCronSessions: Bool
     let showsMessageCount: Bool
@@ -1068,12 +1076,32 @@ struct ScheduledSessionsView: View {
                     )
                 }
             }
+            if viewModel.isHermes && viewModel.hasMoreScheduledSessions && searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Button("Load more") { Task { await viewModel.loadMoreHermesScheduledSessions() } }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .disabled(viewModel.isLoadingMoreScheduledSessions)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .sessionsScreenListRow()
+                    .onAppear { Task { await viewModel.loadMoreHermesScheduledSessions() } }
+            }
         }
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 0)
         .scrollContentBackground(.hidden)
         .navigationTitle("Scheduled sessions")
         .searchable(text: $searchText, prompt: "Search sessions")
+        .task {
+            if viewModel.isHermes { await viewModel.openHermes() }
+        }
+        .task(id: searchText) {
+            if viewModel.isHermes { await viewModel.searchSessions(query: searchText) }
+        }
+        .onChange(of: scenePhase) {
+            guard viewModel.isHermes else { return }
+            if scenePhase == .background { viewModel.closeHermes() }
+            else if scenePhase == .active { Task { await viewModel.openHermes() } }
+        }
         .overlay(alignment: .bottom) {
             if let actionToast {
                 ActionToastView(state: actionToast)

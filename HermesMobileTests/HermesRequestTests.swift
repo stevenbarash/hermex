@@ -81,7 +81,7 @@ final class HermesRequestTests: XCTestCase {
             (.sessionActiveList, "session.active_list", [:]),
             (.promptSubmit(sessionID: "runtime", text: "hi"), "prompt.submit",
              ["session_id": .string("runtime"), "text": .string("hi"), "queued": .bool(true)]),
-            (.promptRewind(sessionID: "runtime", text: "hi", beforeRowID: 41), "prompt.submit",
+            (.promptRewind(sessionID: "runtime", text: "hi", beforeRowID: 41, deep: false), "prompt.submit",
              ["session_id": .string("runtime"), "text": .string("hi"), "truncate_before_row_id": .number(41),
               "confirm_truncate": .bool(true), "confirm_empty_truncate": .bool(true)]),
             (.sessionSteer(sessionID: "runtime", text: "hi"), "session.steer", ["session_id": .string("runtime"), "text": .string("hi")]),
@@ -249,6 +249,7 @@ final class HermesRequestTests: XCTestCase {
         let json = ["Content-Type": "application/json"]
         let imported = BotJSON.object(["sessions": .array([.object(["id": .string("20261008_002420_fb927d")])]),
                                        "profile": .string("triage")])
+        let requestID = try XCTUnwrap(UUID(uuidString: "6F0C1F4E-2B7A-4C59-9E1D-3A8B5C7D9E01"))
         let cases: [(HermesREST, String, String, BotJSON?, [String: String])] = [
             (.status, "GET", "https://hermes.example:9120/api/status", nil, [:]),
             (.login(username: "user", password: "pass"), "POST", "https://hermes.example:9120/auth/password-login",
@@ -278,15 +279,25 @@ final class HermesRequestTests: XCTestCase {
             (.sessionMessages(key: "bg_0a5110", profile: "triage"), "GET",
              "https://hermes.example:9120/api/sessions/bg_0a5110/messages?profile=triage", nil, [:]),
             (.sessionList(profile: "triage", offset: 100, archived: true), "GET",
-             "https://hermes.example:9120/api/sessions?profile=triage&order=recent&archived=only&limit=100&offset=100&exclude_sources=cron,kanban,oneshot,subagent,tool",
+             "https://hermes.example:9120/api/sessions?profile=triage&order=recent&archived=only&limit=100&offset=100&exclude_sources=kanban,oneshot,subagent,tool",
              nil, [:]),
-            (.updateSession(key: "tip", profile: "triage", change: .title("Plan")), "PATCH",
+            (.updateSession(key: "tip", profile: "triage", change: .title("Plan"), identity: nil), "PATCH",
              "https://hermes.example:9120/api/sessions/tip", .object(["title": .string("Plan"), "profile": .string("triage")]), json),
+            (.updateSession(key: "tip", profile: "triage", change: .pinned(true),
+                            identity: HermesSessionWriteIdentity(requestID: requestID, expectedRevision: 7)), "PATCH",
+             "https://hermes.example:9120/api/sessions/tip",
+             .object(["pinned": .bool(true), "profile": .string("triage"), "request_id": .string(requestID.uuidString),
+                      "expected_revision": .number(7)]), json),
+            (.sessionMutationSnapshot(key: "tip", profile: "triage"), "GET",
+             "https://hermes.example:9120/api/sessions/tip/mutation-snapshot?profile=triage", nil, [:]),
             (.sessionExport(key: "tip", profile: "triage"), "GET",
              "https://hermes.example:9120/api/sessions/tip/export?profile=triage", nil, [:]),
             (.sessionRow(key: "tip", profile: "triage"), "GET", "https://hermes.example:9120/api/sessions/tip?profile=triage", nil, [:]),
-            (.importSessions(body: try JSONEncoder().encode(imported)), "POST", "https://hermes.example:9120/api/sessions/import",
-             imported, json),
+            (.importSessions(body: try JSONEncoder().encode(imported),
+                             identity: HermesSessionWriteIdentity(requestID: requestID, expectedRevision: 0)),
+             "POST", "https://hermes.example:9120/api/sessions/import",
+             .object(try XCTUnwrap(imported.fields).merging(["request_id": .string(requestID.uuidString),
+                                                             "expected_revision": .number(0)]) { $1 }), json),
             (.cronJobs, "GET", "https://hermes.example:9120/api/cron/jobs", nil, [:]),
             (.cronCreate(profile: "research", fields: ["schedule": .string("0 9 * * *")]), "POST",
              "https://hermes.example:9120/api/cron/jobs?profile=research", .object(["schedule": .string("0 9 * * *")]), json),
@@ -405,10 +416,10 @@ final class HermesRequestTests: XCTestCase {
         XCTAssertThrowsError(try HermesREST.profileSoul(name: "../config").request(base: base))
         XCTAssertThrowsError(try HermesREST.setProfileSoul(name: "", content: "x").request(base: base))
         XCTAssertThrowsError(try HermesREST.config(profile: "").request(base: base))
-        let upgrade = try HermesREST.gatewayUpgrade(base: base, ticket: "t1")
+        let upgrade = try HermesREST.gatewayUpgrade(base: base, pass: .ticket("t1"))
         XCTAssertEqual(upgrade.url?.absoluteString, "wss://hermes.example:9120/api/ws")
         XCTAssertEqual(upgrade.allHTTPHeaderFields ?? [:], ["Sec-WebSocket-Protocol": "hermes-gateway-v1, hermes-gateway-ticket.t1"])
-        XCTAssertEqual(try HermesREST.gatewayUpgrade(base: URL(string: "http://192.168.1.2:9120")!, ticket: "t1").url?.absoluteString,
+        XCTAssertEqual(try HermesREST.gatewayUpgrade(base: URL(string: "http://192.168.1.2:9120")!, pass: .ticket("t1")).url?.absoluteString,
                        "ws://192.168.1.2:9120/api/ws")
     }
 }

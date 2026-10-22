@@ -536,9 +536,9 @@ import XCTest
     /// without its runtime (#1049).
     func testRewindAdmitsOnlyARowAndThePromptItResends() {
         let rejected: [HermesCall] = [
-            .promptRewind(sessionID: "", text: "hi", beforeRowID: 41),
-            .promptRewind(sessionID: "runtime", text: " \n", beforeRowID: 41),
-            .promptRewind(sessionID: "runtime", text: "hi", beforeRowID: 0),
+            .promptRewind(sessionID: "", text: "hi", beforeRowID: 41, deep: false),
+            .promptRewind(sessionID: "runtime", text: " \n", beforeRowID: 41, deep: false),
+            .promptRewind(sessionID: "runtime", text: "hi", beforeRowID: 0, deep: false),
             .sessionUndo(runtime: "")
         ]
         for call in rejected {
@@ -651,10 +651,10 @@ import XCTest
         XCTAssertTrue(socket.sentRequests.allSatisfy { $0["params"]["scope"] == .string("session") && $0["params"]["session_id"] == .string("runtime") })
     }
 
-    func testMissingPasswordGateFailsBeforeCredentialsOrSocket() async {
+    func testAStatusWithoutTheSignInFlagFailsBeforeCredentialsOrSocket() async {
         BotHTTPFixture.handler = { request in
             XCTAssertEqual(request.url?.path, "/api/status")
-            return (200, .object(["auth_required": .bool(false)]))
+            return (200, .object(["version": .string("0.21.5")]))
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [BotHTTPFixture.self]
